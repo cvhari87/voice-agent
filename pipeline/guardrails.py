@@ -2,19 +2,23 @@
 
 from __future__ import annotations
 
+import calendar
 import hashlib
 import json
+import logging
 import os
 import re
 import threading
 import time
 from dataclasses import asdict, dataclass
+from datetime import date, datetime
 from pathlib import Path
 
 
-POLICY_VERSION = "2026-07-21.1"
+POLICY_VERSION = "2026-07-21.2"
 DEFAULT_MEMORY_PATH = Path(__file__).resolve().parent.parent / "logs" / "guardrail-memory.jsonl"
 _write_lock = threading.Lock()
+logger = logging.getLogger(__name__)
 
 _EMERGENCY_TERMS = (
     "fire", "smoke", "medical emergency", "heart attack", "can't breathe",
@@ -24,6 +28,22 @@ _EMERGENCY_TERMS = (
 )
 _NON_EMERGENCY_CONTEXT = (
     "fireplace", "fire pit", "fire alarm policy", "smoke detector policy",
+    "smoke-free", "smoke free", "smokefree", "no-smoking", "no smoking",
+    "fire safety", "fire exit", "fire extinguisher", "fire escape",
+    "fire alarm test", "fire drill", "fire prevention",
+)
+_NEGATION_PHRASES = (
+    "do not have", "don't have", "dont have",
+    "do not need", "don't need", "dont need",
+    "is not", "isn't", "isnt",
+    "was not", "wasn't", "wasnt",
+    "not a", "not an", "no hay", "no tengo", "no es",
+    "no tiene", "without a", "without any",
+    "never had", "never have",
+)
+_CLAUSE_SPLIT_RE = re.compile(
+    r"[.!?;]|\s*,\s*(?:but|however|although|yet|still)\s+",
+    re.IGNORECASE,
 )
 _PRIVACY_TARGETS = (
     "another guest", "other guest", "someone else's", "another reservation",
@@ -39,6 +59,60 @@ _CONFIRMATION_TERMS = (
 )
 _PHONE_RE = re.compile(r"^\+?[0-9][0-9() .-]{6,20}$")
 _EMAIL_RE = re.compile(r"^[^\s@]+@[^\s@]+\.[^\s@]+$")
+
+# Room capacity limits (must stay in sync with agent._ROOMS).
+_ROOM_CAPACITY = {
+    "standard": 2,
+    "king": 2,
+    "suite": 4,
+    "family": 5,
+    "accessible": 2,
+}
+
+# Output guardrail: distinctive fragments from the system prompt that should
+# never appear in model output sent to the caller.
+_SYSTEM_PROMPT_FRAGMENTS = (
+    "you are a friendly phone reservations agent",
+    "do not answer questions outside hotel booking",
+    "never invent availability, rates, confirmation",
+    "keep replies short and spoken-friendly",
+    "booking flow:",
+    "guardrails:",
+    "use tools for availability and booking",
+    "use search_hotel_knowledge",
+)
+_INJECTION_OUTPUT_MARKERS = (
+    "[system]", "[instruction", "<<sys>>", "<<user>>",
+    "ignore previous", "disregard previous", "ignore above",
+    "you are now", "new persona", "act as",
+    "jailbreak", "developer mode", "dan mode",
+)
+_FABRICATED_CONFIRMATION_RE = re.compile(r"\bAH-\d{3,}", re.IGNORECASE)
+
+# Date parsing formats, most specific first.
+_DATE_FORMATS = (
+    "%Y-%m-%d",
+    "%m/%d/%Y",
+    "%m-%d-%Y",
+    "%d/%m/%Y",
+    "%B %d, %Y",
+    "%B %d %Y",
+    "%B %d",
+    "%b %d, %Y",
+    "%b %d %Y",
+    "%b %d",
+)
+
+# Booking stages (state machine):
+# empty -> availability_pending -> availability_checked -> summary_presented -> booking_authorized -> booked
+_VALID_STAGES = frozenset({
+    "empty",
+    "availability_pending",
+    "availability_checked",
+    "summary_presented",
+    "booking_authorized",
+    "booked",
+})
 
 
 @dataclass(frozen=True)
@@ -71,10 +145,18 @@ class GuardrailMemory:
             with _write_lock:
                 with self.path.open("a", encoding="utf-8") as handle:
                     handle.write(json.dumps(record, ensure_ascii=True) + "\n")
+                # Self-healing: an audit log shouldn't stay world-readable just
+                # because it pre-dates this fix or the umask was permissive.
+                os.chmod(self.path, 0o600)
             self.last_error = None
         except OSError as exc:
             # Safety decisions must still run if the audit destination is unavailable.
             self.last_error = type(exc).__name__
+            logger.warning(
+                "guardrail memory write failed (%s); safety decisions are still"
+                " enforced but this event has no audit record",
+                self.last_error,
+            )
 
     def recent(self, session_id: str | None = None, limit: int = 50) -> list[dict]:
         try:
@@ -99,12 +181,16 @@ class GuardrailMemory:
 
 
 class GuardrailAgent:
-    """Evaluate caller input and model-requested tool calls before execution."""
+    """Evaluate caller input, tool calls, and model output before delivery."""
 
     def __init__(self, memory: GuardrailMemory | None = None, max_tool_rounds: int = 6):
         self.memory = memory or GuardrailMemory()
         self.max_tool_rounds = max_tool_rounds
         self._session_state: dict[str, dict] = {}
+
+    # ------------------------------------------------------------------
+    # Input guardrail
+    # ------------------------------------------------------------------
 
     def evaluate_input(self, text: str, session_id: str) -> GuardrailDecision:
         normalized = " ".join(text.lower().split())
@@ -115,8 +201,7 @@ class GuardrailAgent:
                                   "That request is too long to process safely. Please say it more briefly."),
                 text=text,
             )
-        if (_contains_phrase(normalized, _EMERGENCY_TERMS)
-                and not _contains_phrase(normalized, _NON_EMERGENCY_CONTEXT)):
+        if _is_emergency(normalized):
             return self._decision(
                 session_id,
                 GuardrailDecision(
@@ -145,6 +230,10 @@ class GuardrailAgent:
             GuardrailDecision(True, "input", "input passed deterministic policy"),
             text=text,
         )
+
+    # ------------------------------------------------------------------
+    # Tool-call guardrail
+    # ------------------------------------------------------------------
 
     def evaluate_tool_call(
         self,
@@ -201,10 +290,13 @@ class GuardrailAgent:
             argumentKeys=sorted(arguments),
             toolRound=tool_round,
         )
+        # On allowed check_availability: move to availability_pending (not
+        # availability_checked). The actual result must be verified first via
+        # process_availability_result() before booking can proceed.
         if recorded.allowed and name == "check_availability":
             previous_stage = self._session_state.get(session_id, {}).get("stage", "empty")
             self._session_state[session_id] = {
-                "stage": "availability_checked",
+                "stage": "availability_pending",
                 "availability": {
                     "check_in": str(arguments["check_in"]).strip(),
                     "check_out": str(arguments["check_out"]).strip(),
@@ -214,7 +306,7 @@ class GuardrailAgent:
                 "turn_id": turn_id,
                 "booking_fingerprints": set(),
             }
-            self.remember_change(session_id, "bookingStage", previous_stage, "availability_checked")
+            self.remember_change(session_id, "bookingStage", previous_stage, "availability_pending")
         if recorded.allowed and name == "create_booking":
             state = self._session_state[session_id]
             fingerprint = _booking_fingerprint(arguments)
@@ -223,6 +315,116 @@ class GuardrailAgent:
             state["stage"] = "booking_authorized"
             self.remember_change(session_id, "bookingStage", previous_stage, "booking_authorized")
         return recorded
+
+    # ------------------------------------------------------------------
+    # Availability result verification (Fix #1)
+    # ------------------------------------------------------------------
+
+    def process_availability_result(self, session_id: str, result: dict) -> None:
+        """Verify the availability tool result before advancing the booking state.
+
+        Must be called after check_availability executes. Only advances from
+        availability_pending to availability_checked if rooms were found.
+        """
+        state = self._session_state.get(session_id)
+        if not state or state.get("stage") != "availability_pending":
+            return
+        result_text = str(result.get("result", ""))
+        if "no matching rooms" in result_text.lower():
+            previous_stage = state["stage"]
+            state["stage"] = "empty"
+            self.remember_change(session_id, "bookingStage", previous_stage, "empty")
+            self.memory.remember(
+                session_id,
+                "availability.no_rooms",
+                resultSummary="no matching rooms found",
+            )
+            return
+        state["stage"] = "availability_checked"
+        state["available_rooms_text"] = result_text
+        self.remember_change(session_id, "bookingStage", "availability_pending", "availability_checked")
+
+    # ------------------------------------------------------------------
+    # Output guardrail (Fix #4)
+    # ------------------------------------------------------------------
+
+    def evaluate_output(
+        self,
+        text: str,
+        session_id: str,
+        had_booking_tool: bool = False,
+    ) -> GuardrailDecision:
+        """Evaluate model output before sending to the caller.
+
+        Args:
+            text: The model's response text.
+            session_id: Current session identifier.
+            had_booking_tool: True if create_booking was executed this turn.
+        """
+        if not text or not text.strip():
+            return self._decision(
+                session_id,
+                GuardrailDecision(True, "output", "empty output passed"),
+            )
+
+        normalized = " ".join(text.lower().split())
+
+        # Check for system prompt leakage.
+        for fragment in _SYSTEM_PROMPT_FRAGMENTS:
+            if fragment in normalized:
+                return self._decision(
+                    session_id,
+                    GuardrailDecision(
+                        False,
+                        "output_leak",
+                        f"model output contained system prompt fragment",
+                        "I can help you with hotel reservations. Would you like to book, change, or cancel a stay?",
+                    ),
+                    fragment=fragment,
+                )
+
+        # Check for prompt injection output markers.
+        for marker in _INJECTION_OUTPUT_MARKERS:
+            if marker in normalized:
+                return self._decision(
+                    session_id,
+                    GuardrailDecision(
+                        False,
+                        "output_injection",
+                        "model output contained injection marker",
+                        "I can help you with hotel reservations. Would you like to book, change, or cancel a stay?",
+                    ),
+                    marker=marker,
+                )
+
+        # Check for fabricated booking confirmations.
+        if _FABRICATED_CONFIRMATION_RE.search(text) and not had_booking_tool:
+            return self._decision(
+                session_id,
+                GuardrailDecision(
+                    False,
+                    "output_fabrication",
+                    "model output contained confirmation code without booking tool execution",
+                    "I need to complete the booking process first. Could you confirm the details so I can reserve your room?",
+                ),
+            )
+
+        # Advance booking state: if availability was checked and the model
+        # is now speaking (presenting options), advance to summary_presented.
+        state = self._session_state.get(session_id)
+        if state and state.get("stage") == "availability_checked":
+            previous_stage = state["stage"]
+            state["stage"] = "summary_presented"
+            self.remember_change(session_id, "bookingStage", previous_stage, "summary_presented")
+
+        return self._decision(
+            session_id,
+            GuardrailDecision(True, "output", "output passed deterministic policy"),
+        )
+
+    # ------------------------------------------------------------------
+    # State & memory helpers
+    # ------------------------------------------------------------------
 
     def remember_change(self, session_id: str, field: str, before, after) -> None:
         if before == after:
@@ -262,6 +464,10 @@ class GuardrailAgent:
         )
         return decision
 
+    # ------------------------------------------------------------------
+    # Tool-specific validators
+    # ------------------------------------------------------------------
+
     @staticmethod
     def _validate_language(args: dict) -> str:
         return "" if args.get("language") in {"en", "es"} else "unsupported language"
@@ -273,6 +479,24 @@ class GuardrailAgent:
         guests = _guest_count(args.get("guests"))
         if guests is None or not 1 <= guests <= 20:
             return "guest count must be between 1 and 20"
+
+        # Date validation: parse and enforce checkout > checkin.
+        check_in_date = _parse_date(str(args["check_in"]).strip())
+        check_out_date = _parse_date(str(args["check_out"]).strip())
+        if check_in_date and check_out_date:
+            if check_out_date <= check_in_date:
+                return "check-out date must be after check-in date"
+
+        # Room capacity pre-check: if a room type is specified, reject early
+        # when guest count exceeds its capacity.
+        room_type = str(args.get("room_type") or "").strip().lower()
+        if room_type and room_type in _ROOM_CAPACITY:
+            if guests > _ROOM_CAPACITY[room_type]:
+                return (
+                    f"{room_type} room holds {_ROOM_CAPACITY[room_type]} guests "
+                    f"but {guests} were requested"
+                )
+
         return ""
 
     def _validate_booking(
@@ -288,12 +512,29 @@ class GuardrailAgent:
         guests = _guest_count(args.get("guests"))
         if guests is None or not 1 <= guests <= 5:
             return "booking guest count must be between 1 and 5"
-        if str(args["room_type"]).strip().lower() not in {
-            "standard", "king", "suite", "family", "accessible",
-        }:
+
+        room_type = str(args["room_type"]).strip().lower()
+        if room_type not in _ROOM_CAPACITY:
             return "unknown room type"
-        if str(args["check_in"]).strip().lower() == str(args["check_out"]).strip().lower():
+
+        # Room capacity enforcement.
+        if guests > _ROOM_CAPACITY[room_type]:
+            return (
+                f"{room_type} room holds {_ROOM_CAPACITY[room_type]} guests "
+                f"but {guests} were requested"
+            )
+
+        # Date validation.
+        check_in_str = str(args["check_in"]).strip()
+        check_out_str = str(args["check_out"]).strip()
+        if check_in_str.lower() == check_out_str.lower():
             return "check-in and check-out cannot be the same"
+        check_in_date = _parse_date(check_in_str)
+        check_out_date = _parse_date(check_out_str)
+        if check_in_date and check_out_date:
+            if check_out_date <= check_in_date:
+                return "check-out date must be after check-in date"
+
         contact = str(args["contact"]).strip()
         if not (_EMAIL_RE.fullmatch(contact) or _PHONE_RE.fullmatch(contact)):
             return "contact must be a valid email address or phone number"
@@ -301,8 +542,18 @@ class GuardrailAgent:
         if not _contains_phrase(normalized_caller, _CONFIRMATION_TERMS):
             return "caller has not explicitly confirmed this booking"
         state = self._session_state.get(session_id)
-        if not state or state.get("stage") != "availability_checked":
+        if not state:
             return "availability must be checked before booking"
+
+        # Require summary_presented (not just availability_checked). This
+        # ensures Aurora actually spoke to the caller before booking.
+        if state.get("stage") not in ("summary_presented",):
+            if state.get("stage") == "availability_checked":
+                return "booking summary must be presented to the caller before booking"
+            if state.get("stage") == "availability_pending":
+                return "availability result has not been verified"
+            return "availability must be checked before booking"
+
         if turn_id is not None and state.get("turn_id") == turn_id:
             return "booking confirmation must occur on a later turn"
         offered = state["availability"]
@@ -326,6 +577,78 @@ class GuardrailAgent:
             return "knowledge query is required"
         return "" if len(str(query)) <= 1000 else "knowledge query is too long"
 
+
+# ------------------------------------------------------------------
+# Emergency detection with clause-level analysis (Fix #3)
+# ------------------------------------------------------------------
+
+def _is_emergency(normalized_text: str) -> bool:
+    """Detect emergencies with clause-splitting and negation awareness.
+
+    Splits compound sentences so that non-emergency context (e.g. "fire alarm
+    policy") in one clause does not suppress a real emergency ("smoke in my
+    room") in another clause.
+    """
+    clauses = _CLAUSE_SPLIT_RE.split(normalized_text)
+    if not clauses:
+        clauses = [normalized_text]
+
+    for clause in clauses:
+        clause = clause.strip()
+        if not clause:
+            continue
+        # Does this clause contain any emergency term?
+        if not _contains_phrase(clause, _EMERGENCY_TERMS):
+            continue
+        # Is the emergency term neutralized by non-emergency context in
+        # THIS clause specifically?
+        if _contains_phrase(clause, _NON_EMERGENCY_CONTEXT):
+            continue
+        # Is the emergency term negated?
+        if _has_negation(clause):
+            continue
+        # Unambiguous emergency in this clause.
+        return True
+    return False
+
+
+def _has_negation(clause: str) -> bool:
+    """Check whether the clause negates the emergency meaning."""
+    for phrase in _NEGATION_PHRASES:
+        if phrase in clause:
+            return True
+    return False
+
+
+# ------------------------------------------------------------------
+# Date parsing (Fix #1)
+# ------------------------------------------------------------------
+
+def _parse_date(text: str) -> date | None:
+    """Best-effort date parsing. Returns None if no format matches."""
+    text = text.strip()
+    if not text:
+        return None
+    # Try each format.
+    for fmt in _DATE_FORMATS:
+        try:
+            parsed = datetime.strptime(text, fmt)
+            # Formats without a year default to 1900; assume current or next year.
+            if "%Y" not in fmt and "%y" not in fmt:
+                today = date.today()
+                candidate = parsed.replace(year=today.year).date()
+                if candidate < today:
+                    candidate = parsed.replace(year=today.year + 1).date()
+                return candidate
+            return parsed.date()
+        except ValueError:
+            continue
+    return None
+
+
+# ------------------------------------------------------------------
+# Shared helpers
+# ------------------------------------------------------------------
 
 def _present_text(value) -> bool:
     return isinstance(value, str) and bool(value.strip())

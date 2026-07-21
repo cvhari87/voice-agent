@@ -376,6 +376,7 @@ class Agent:
             )
         first_model_call = True
         tool_round = 0
+        had_booking_tool = False
 
         while True:
             with trace.span("llm", model=getattr(self.provider, "llm_model", "unknown")):
@@ -394,6 +395,23 @@ class Agent:
 
             if not msg.tool_calls:
                 reply = msg.content or ""
+                # --- Output guardrail (Fix #4) ---
+                output_decision = self.guardrail.evaluate_output(
+                    reply, trace.session_id, had_booking_tool=had_booking_tool,
+                )
+                trace.event(
+                    "guardrail.output_evaluated",
+                    allowed=output_decision.allowed,
+                    category=output_decision.category,
+                    reason=output_decision.reason,
+                )
+                if not output_decision.allowed:
+                    reply = output_decision.response
+                    trace.event(
+                        "guardrail.output_blocked",
+                        category=output_decision.category,
+                        reason=output_decision.reason,
+                    )
                 self.messages.append({"role": "assistant", "content": reply})
                 trace.event("assistant.response", text=reply, action=action)
                 return reply, action
@@ -509,6 +527,17 @@ class Agent:
                         tc.function.name,
                         result,
                     )
+                    # Verify availability results before advancing state (Fix #1).
+                    if tc.function.name == "check_availability":
+                        self.guardrail.process_availability_result(
+                            trace.session_id, result,
+                        )
+                        trace.event(
+                            "guardrail.availability_verified",
+                            hasRooms="no matching rooms" not in result.get("result", "").lower(),
+                        )
+                    if tc.function.name == "create_booking":
+                        had_booking_tool = True
                 self.last_sources.extend(result.get("sources", []))
                 if result.get("action"):
                     self.guardrail.remember_change(

@@ -61,6 +61,7 @@ let currentTurnWasBargeIn = false;
 let activeAgentAudio = null;
 let playbackToken = 0;
 let bargeRecordingCandidate = false;
+let accessKey = "";
 
 const tuning = {
   endpointSilenceMs: 650,
@@ -71,6 +72,18 @@ const tuning = {
   bargeInArmMs: 450,
   maxTurnMs: 20000,
 };
+
+/**
+ * Build common headers for all server requests, including the access key
+ * when TALK_ACCESS_KEY is configured on the server.
+ */
+function authHeaders(extra = {}) {
+  const headers = { ...extra };
+  if (accessKey) {
+    headers["X-Access-Key"] = accessKey;
+  }
+  return headers;
+}
 
 function setCallControls(connected) {
   startButton.disabled = connected;
@@ -343,12 +356,12 @@ async function sendAudioToAgent(audioBlob) {
   try {
     const response = await fetch("/voice-agent", {
       method: "POST",
-      headers: {
+      headers: authHeaders({
         "Content-Type": audioBlob.type || "audio/webm",
         "X-Session-ID": sessionId,
         "X-Turn-ID": turnId,
         "X-Barge-In": String(wasBargeIn),
-      },
+      }),
       body: audioBlob,
     });
     const payload = await response.json();
@@ -475,6 +488,7 @@ function attachRoomEvents(room) {
 
 async function connectParticipant(role) {
   const params = new URLSearchParams({ role });
+  if (accessKey) params.set("key", accessKey);
   const response = await fetch(`/token?${params}`);
   if (!response.ok) throw new Error(`Token request failed: ${response.status}`);
   const session = await response.json();
@@ -537,7 +551,10 @@ async function startCall() {
   agentBusy = true;
   callerStatus.textContent = "Connecting";
   agentStatus.textContent = "Connecting";
-  await fetch("/reset", { method: "POST", headers: { "X-Session-ID": sessionId } });
+  await fetch("/reset", {
+    method: "POST",
+    headers: authHeaders({ "X-Session-ID": sessionId }),
+  });
   agentRoom = await connectParticipant("agent");
   agentStatus.textContent = "Connected";
   await prepareListener();
@@ -551,7 +568,7 @@ async function startCall() {
   try {
     const greetingResponse = await fetch("/greeting", {
       method: "POST",
-      headers: { "X-Session-ID": sessionId },
+      headers: authHeaders({ "X-Session-ID": sessionId }),
     });
     const greeting = await greetingResponse.json();
     if (!greetingResponse.ok) throw new Error(greeting.error || "Greeting failed");
@@ -616,6 +633,11 @@ async function loadState() {
     const response = await fetch("/state");
     const state = await response.json();
     providerEl.textContent = `Provider: ${state.agentProvider}`;
+    // If server requires an access key, prompt the user for it.
+    if (state.accessKeyRequired) {
+      const key = prompt("This server requires an access key. Enter your TALK_ACCESS_KEY:");
+      if (key) accessKey = key.trim();
+    }
   } catch {
     providerEl.textContent = "Provider: unavailable";
   }

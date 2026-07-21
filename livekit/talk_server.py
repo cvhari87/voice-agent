@@ -32,6 +32,9 @@ PIPELINE_ROOT = ASSIGNMENT_ROOT / "pipeline"
 
 TOKEN_TTL = timedelta(hours=1)
 
+# Maximum request body size: 10 MB (generous for audio chunks).
+MAX_BODY_BYTES = int(os.getenv("TALK_MAX_BODY_BYTES", str(10 * 1024 * 1024)))
+
 # The demo only ever needs these two fixed room participants. Mapping a
 # server-controlled role (rather than trusting client-supplied identity/room)
 # means a caller can't mint a token for an arbitrary identity or room.
@@ -77,16 +80,32 @@ def _livekit_room() -> str:
 
 
 def _access_key() -> str | None:
-    """Optional shared secret gating /token. Unset = no gate (local dev)."""
+    """Optional shared secret gating all API endpoints. Unset = no gate (local dev)."""
     return os.getenv("TALK_ACCESS_KEY") or None
 
 
-def _token_request_authorized(query: dict) -> bool:
+def _request_authorized(handler: "Handler") -> bool:
+    """Check authorization for any request.
+
+    When TALK_ACCESS_KEY is set, the request must include it as either:
+      - Query parameter: ?key=<value>
+      - Header: X-Access-Key: <value>
+    When TALK_ACCESS_KEY is unset, all requests are allowed (local dev).
+    """
     required = _access_key()
     if not required:
         return True
+    parsed = urlparse(handler.path)
+    query = parse_qs(parsed.query)
+    # Check query parameter first (used by /token).
     provided = query.get("key", [""])[0]
-    return secrets.compare_digest(provided, required)
+    if provided and secrets.compare_digest(provided, required):
+        return True
+    # Check header (used by POST endpoints and frontend).
+    header_value = handler.headers.get("X-Access-Key", "")
+    if header_value and secrets.compare_digest(header_value, required):
+        return True
+    return False
 
 
 def _new_agent():
@@ -305,14 +324,16 @@ class Handler(SimpleHTTPRequestHandler):
                 "livekitUrl": _livekit_url(),
                 "agentProvider": _agent_provider_name(),
                 "languages": ["en", "es"],
+                "accessKeyRequired": _access_key() is not None,
             })
         if parsed.path != "/token":
             return super().do_GET()
 
-        query = parse_qs(parsed.query)
-        if not _token_request_authorized(query):
+        # Auth check for /token.
+        if not _request_authorized(self):
             return self._send_json({"error": "unauthorized"}, status=401)
 
+        query = parse_qs(parsed.query)
         role = query.get("role", [""])[0]
         participant = _DEMO_PARTICIPANTS.get(role)
         if participant is None:
@@ -329,9 +350,14 @@ class Handler(SimpleHTTPRequestHandler):
         self._send_json(payload)
 
     def do_POST(self) -> None:
+        # Auth check for all POST endpoints.
+        if not _request_authorized(self):
+            return self._send_json({"error": "unauthorized"}, status=401)
+
         parsed = urlparse(self.path)
         session_id = self.headers.get("X-Session-ID", "browser-demo")
         turn_id = self.headers.get("X-Turn-ID")
+
         if parsed.path == "/reset":
             _reset_session(session_id)
             return self._send_json({"reset": True, "sessionId": session_id})
@@ -347,8 +373,9 @@ class Handler(SimpleHTTPRequestHandler):
             return
 
         try:
-            length = int(self.headers.get("Content-Length", "0"))
-            body = self.rfile.read(length)
+            body = self._read_body()
+            if body is None:
+                return  # error already sent
             payload = json.loads(body or b"{}")
             text = str(payload.get("text", "")).strip()
             if not text:
@@ -361,8 +388,9 @@ class Handler(SimpleHTTPRequestHandler):
 
     def _handle_voice_agent(self, session_id: str, turn_id: str | None) -> None:
         try:
-            length = int(self.headers.get("Content-Length", "0"))
-            audio = self.rfile.read(length)
+            audio = self._read_body()
+            if audio is None:
+                return  # error already sent
             if not audio:
                 raise ValueError("Missing audio")
             response = _voice_agent_reply(
@@ -376,6 +404,23 @@ class Handler(SimpleHTTPRequestHandler):
             self._send_json({"error": str(exc)}, status=500)
             return
         self._send_json(response)
+
+    def _read_body(self) -> bytes | None:
+        """Read the request body, enforcing the max body size limit.
+
+        Returns the body bytes, or None if the body exceeds MAX_BODY_BYTES
+        (in which case a 413 response is already sent).
+        """
+        length = int(self.headers.get("Content-Length", "0"))
+        if length > MAX_BODY_BYTES:
+            self._send_json(
+                {"error": f"Request body too large (max {MAX_BODY_BYTES} bytes)"},
+                status=413,
+            )
+            return None
+        if length <= 0:
+            return b""
+        return self.rfile.read(length)
 
     def _send_json(self, payload: dict, status: int = 200) -> None:
         body = json.dumps(payload).encode("utf-8")
@@ -398,6 +443,8 @@ def main() -> None:
     print(f"Room: {_livekit_room()}")
     print(f"Agent provider: {_agent_provider_name()}")
     print(f"TTS backend: {os.getenv('TTS_BACKEND', 'provider').lower()}")
+    access_status = "enabled" if _access_key() else "disabled (local dev)"
+    print(f"Access key: {access_status}")
     print("Use the two panes for LiveKit audio. Use the conversation panel for the hotel agent.")
     try:
         server.serve_forever()
