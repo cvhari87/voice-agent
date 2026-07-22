@@ -23,8 +23,10 @@ from livekit import api
 
 from env_loader import load_env_files
 
-HOST = os.getenv("TALK_HOST", "localhost")
-PORT = int(os.getenv("TALK_PORT", "5173"))
+# Railway (and most PaaS targets) inject $PORT and require binding 0.0.0.0;
+# local dev has neither set, so it keeps the old localhost:5173 default.
+HOST = os.getenv("TALK_HOST", "0.0.0.0" if os.getenv("PORT") else "localhost")
+PORT = int(os.getenv("PORT") or os.getenv("TALK_PORT", "5173"))
 ROOT = Path(__file__).resolve().parent
 WEB_ROOT = ROOT / "web"
 ASSIGNMENT_ROOT = ROOT.parent

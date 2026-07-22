@@ -1,0 +1,16 @@
+.git
+.gitignore
+.dockerignore
+Dockerfile
+
+**/.env
+**/.venv
+**/node_modules
+**/__pycache__
+**/*.pyc
+
+logs/
+*.md
+
+mocks/
+evals/
