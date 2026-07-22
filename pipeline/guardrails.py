@@ -57,6 +57,19 @@ _CONFIRMATION_TERMS = (
     "yes", "confirm", "book it", "go ahead", "reserve it", "do it",
     "sí", "si", "confirmo", "resérvala", "reservala", "adelante",
 )
+# Negation of an actual booking action ("do not book it"), distinct from
+# _NEGATION_PHRASES above which is tuned for negating an emergency's object
+# ("don't have a fire extinguisher").
+_BOOKING_NEGATION_MARKERS = (
+    "do not", "don't", "dont", "does not", "doesn't", "doesnt",
+    "did not", "didn't", "didnt", "never", "no longer", "not",
+    "no confirmes", "no lo hagas", "no reserves",
+)
+# How many words immediately before a matched term count as "nearby" for
+# negation purposes. Keeping this small is the point: a negation elsewhere
+# in a long sentence (e.g. "I don't have a phone and there is smoke") must
+# not suppress an unrelated match later in the same clause.
+_NEGATION_WINDOW_WORDS = 4
 _PHONE_RE = re.compile(r"^\+?[0-9][0-9() .-]{6,20}$")
 _EMAIL_RE = re.compile(r"^[^\s@]+@[^\s@]+\.[^\s@]+$")
 
@@ -539,7 +552,7 @@ class GuardrailAgent:
         if not (_EMAIL_RE.fullmatch(contact) or _PHONE_RE.fullmatch(contact)):
             return "contact must be a valid email address or phone number"
         normalized_caller = " ".join(caller_text.lower().split())
-        if not _contains_phrase(normalized_caller, _CONFIRMATION_TERMS):
+        if not _caller_confirmed_booking(normalized_caller):
             return "caller has not explicitly confirmed this booking"
         state = self._session_state.get(session_id)
         if not state:
@@ -587,7 +600,11 @@ def _is_emergency(normalized_text: str) -> bool:
 
     Splits compound sentences so that non-emergency context (e.g. "fire alarm
     policy") in one clause does not suppress a real emergency ("smoke in my
-    room") in another clause.
+    room") in another clause. Negation is checked in a short word-window
+    immediately before the *specific* matched emergency term, not anywhere
+    in the whole clause -- otherwise "I don't have a phone and there is
+    smoke" would have its unrelated "don't have" (about the phone) suppress
+    the real hazard ("smoke") elsewhere in the same clause.
     """
     clauses = _CLAUSE_SPLIT_RE.split(normalized_text)
     if not clauses:
@@ -597,27 +614,57 @@ def _is_emergency(normalized_text: str) -> bool:
         clause = clause.strip()
         if not clause:
             continue
-        # Does this clause contain any emergency term?
-        if not _contains_phrase(clause, _EMERGENCY_TERMS):
-            continue
-        # Is the emergency term neutralized by non-emergency context in
-        # THIS clause specifically?
+        # Is any emergency term in this clause neutralized by non-emergency
+        # context (e.g. "fire alarm policy")?
         if _contains_phrase(clause, _NON_EMERGENCY_CONTEXT):
             continue
-        # Is the emergency term negated?
-        if _has_negation(clause):
-            continue
-        # Unambiguous emergency in this clause.
-        return True
-    return False
-
-
-def _has_negation(clause: str) -> bool:
-    """Check whether the clause negates the emergency meaning."""
-    for phrase in _NEGATION_PHRASES:
-        if phrase in clause:
+        for term in _EMERGENCY_TERMS:
+            match = re.search(rf"(?<!\w){re.escape(term)}(?!\w)", clause, flags=re.UNICODE)
+            if not match:
+                continue
+            if _term_negated_nearby(clause, match.start(), _NEGATION_PHRASES):
+                continue
+            # Unambiguous emergency term, not locally negated.
             return True
     return False
+
+
+def _term_negated_nearby(text: str, term_start: int, markers: tuple[str, ...]) -> bool:
+    """Check for a negation marker in the few words immediately before a
+    matched term's position, rather than anywhere in the whole text."""
+    preceding_words = text[:term_start].split()[-_NEGATION_WINDOW_WORDS:]
+    window = " ".join(preceding_words)
+    return any(marker in window for marker in markers)
+
+
+def _caller_confirmed_booking(normalized_caller: str) -> bool:
+    """Require an explicit, unnegated confirmation term.
+
+    Splits into clauses (same boundary as emergency detection) so a
+    contrastive correction anywhere in the utterance -- "Yes, but do not
+    book it," "No, do not do it," "Actually, do not confirm" -- overrides
+    any earlier bare agreement, rather than an isolated "yes" satisfying
+    the check regardless of what follows it.
+    """
+    clauses = _CLAUSE_SPLIT_RE.split(normalized_caller)
+    if not clauses:
+        clauses = [normalized_caller]
+
+    found_confirmation = False
+    for clause in clauses:
+        clause = clause.strip()
+        if not clause:
+            continue
+        for term in _CONFIRMATION_TERMS:
+            match = re.search(rf"(?<!\w){re.escape(term)}(?!\w)", clause, flags=re.UNICODE)
+            if not match:
+                continue
+            if _term_negated_nearby(clause, match.start(), _BOOKING_NEGATION_MARKERS):
+                # An explicit rejection or correction anywhere in the
+                # utterance overrides any earlier agreement.
+                return False
+            found_confirmation = True
+    return found_confirmation
 
 
 # ------------------------------------------------------------------

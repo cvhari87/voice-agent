@@ -1,7 +1,7 @@
 # Demo Recording Script
 
 Deployed URL: https://voice-agent-production-8dbe.up.railway.app
-Access key (enter when prompted on page load): `9e45c64b4e90aa5420da575542411c13`
+Access key (enter when prompted on page load): see `TALK_ACCESS_KEY` in Railway's Variables tab — never commit the real value here.
 
 Start screen recording before opening the URL. Keep the transcript, sources, and
 telemetry/pipeline panels visible in frame throughout — that's the evidence the

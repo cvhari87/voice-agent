@@ -119,6 +119,33 @@ class ToolArgumentParsingTests(unittest.TestCase):
             [event["name"] for event in trace.events],
         )
 
+    def test_generation_failure_recovers_on_retry(self):
+        """The malformed-generation failure above was observed to be
+        non-deterministic (temperature > 0): the identical request sometimes
+        succeeds on a second attempt. A transient single-attempt failure
+        should recover via retry rather than immediately degrading to the
+        apology, so a caller doesn't get "sorry, say that again" for a
+        problem that resolves itself one call later."""
+        class FlakyOnceProvider(MockProvider):
+            def __init__(self):
+                super().__init__()
+                self.attempts = 0
+
+            def chat(self, messages, tools=None, tool_choice=None):
+                if messages[-1].get("role") == "user":
+                    self.attempts += 1
+                    if self.attempts == 1:
+                        raise RuntimeError("tool call validation failed: malformed function syntax")
+                return super().chat(messages, tools=tools, tool_choice=tool_choice)
+
+        provider = FlakyOnceProvider()
+        agent = Agent(provider)
+        trace = TurnTrace(session_id="test", turn_id="flaky-once")
+        reply, action = agent.respond("Please speak Spanish.", trace=trace)
+
+        self.assertNotIn("sorry", reply.lower())
+        self.assertEqual(provider.attempts, 2)
+
 
 class ProviderConfigurationTests(unittest.TestCase):
     def test_blank_model_override_uses_provider_default(self):

@@ -394,24 +394,32 @@ class Agent:
                         if first_model_call and required_tool
                         else None
                     )
-                try:
-                    resp = self.provider.chat(
-                        self.messages,
-                        tools=TOOLS,
-                        tool_choice=tool_choice,
-                    )
-                except Exception as exc:
-                    # Observed with Groq/Llama: the model occasionally emits
-                    # malformed native tool-call syntax (e.g. a missing ">"
-                    # before the JSON args), which the provider rejects with
-                    # a 400 rather than ever returning a response object. Left
-                    # unhandled, that exception propagates all the way to the
-                    # caller as a raw error. Degrade gracefully instead: ask
-                    # the caller to repeat rather than crashing the turn.
-                    trace.event(
-                        "llm.generation_failed",
-                        errorType=type(exc).__name__,
-                    )
+                # Observed with Groq/Llama: the model occasionally emits
+                # malformed native tool-call syntax (e.g. a missing ">"
+                # before the JSON args), which the provider rejects with a
+                # 400 rather than ever returning a response object. This is
+                # not fully deterministic (temperature > 0), so one retry
+                # with identical inputs often succeeds. Left unhandled
+                # entirely, the exception would propagate all the way to the
+                # caller as a raw displayed error.
+                resp = None
+                for attempt in range(2):
+                    try:
+                        resp = self.provider.chat(
+                            self.messages,
+                            tools=TOOLS,
+                            tool_choice=tool_choice,
+                        )
+                        break
+                    except Exception as exc:
+                        trace.event(
+                            "llm.generation_failed",
+                            errorType=type(exc).__name__,
+                            attempt=attempt,
+                        )
+                if resp is None:
+                    # Both attempts failed; degrade gracefully rather than
+                    # crash the turn.
                     reply = "Sorry, I didn't catch that. Could you say that again?"
                     self.messages.append({"role": "assistant", "content": reply})
                     return reply, action

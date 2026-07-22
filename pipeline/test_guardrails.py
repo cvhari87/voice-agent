@@ -58,6 +58,30 @@ class GuardrailInputTests(unittest.TestCase):
         self.assertFalse(decision.allowed)
         self.assertEqual(decision.category, "privacy")
 
+    def test_unrelated_negation_does_not_suppress_a_real_emergency(self):
+        """A negation elsewhere in the clause (about the phone, the key, the
+        drill) must not suppress an unrelated real hazard (smoke, fire)
+        later in the same clause."""
+        for text in (
+            "I do not have a phone and there is smoke in my room",
+            "I don't have a key but there is a fire",
+            "This is not a drill, there is smoke",
+        ):
+            with self.subTest(text=text):
+                decision = self.guardrail.evaluate_input(text, "negation-emergency")
+                self.assertFalse(decision.allowed, text)
+                self.assertEqual(decision.category, "emergency", text)
+
+    def test_negation_of_the_hazard_itself_is_still_suppressed(self):
+        """Fixing the bug above must not make negation useless: negating the
+        actual hazard object ("don't have a fire extinguisher") should still
+        correctly not be treated as an emergency."""
+        decision = self.guardrail.evaluate_input(
+            "I don't have a fire extinguisher",
+            "negated-hazard",
+        )
+        self.assertTrue(decision.allowed)
+
 
 class EmergencyDetectionTests(unittest.TestCase):
     """Fix #3: clause-splitting and negation handling for emergency detection."""
@@ -545,6 +569,33 @@ class GuardrailToolTests(unittest.TestCase):
         )
         self.assertFalse(denied.allowed)
         self.assertTrue(allowed.allowed)
+
+    def test_negated_confirmation_does_not_authorize_booking(self):
+        """A confirmation word appearing anywhere in the utterance must not
+        authorize a booking if it's followed by an explicit correction or
+        rejection ("Yes, but do not book it")."""
+        availability = {
+            "check_in": "August 12", "check_out": "August 14",
+            "guests": 2, "room_type": "standard",
+        }
+        self.guardrail.evaluate_tool_call(
+            "check_availability", availability, "I need a room", "negated-confirm", 1, "availability-turn",
+        )
+        self.guardrail.process_availability_result(
+            "negated-confirm",
+            {"result": "Available rooms for August 12 to August 14: Standard Queen at $189/night."},
+        )
+        self.guardrail.evaluate_output(
+            "I have a Standard Queen available. Shall I book it?",
+            "negated-confirm",
+        )
+        for text in ("Yes, but do not book it", "No, do not do it", "Actually, do not confirm"):
+            with self.subTest(text=text):
+                decision = self.guardrail.evaluate_tool_call(
+                    "create_booking", self.booking, text, "negated-confirm", 1, "confirm-turn",
+                )
+                self.assertFalse(decision.allowed, text)
+                self.assertIn("not explicitly confirmed", decision.reason, text)
 
     def test_booking_rejects_invalid_fields(self):
         invalid = dict(self.booking, guests=-5, contact="not-contact")
