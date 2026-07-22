@@ -89,21 +89,16 @@ def _access_key() -> str | None:
 def _request_authorized(handler: "Handler") -> bool:
     """Check authorization for any request.
 
-    When TALK_ACCESS_KEY is set, the request must include it as either:
-      - Query parameter: ?key=<value>
-      - Header: X-Access-Key: <value>
+    When TALK_ACCESS_KEY is set, the request must include it via the
+    X-Access-Key header.  Query-parameter transport is intentionally
+    avoided because query strings leak into browser history, server
+    access logs, and Referer headers.
+
     When TALK_ACCESS_KEY is unset, all requests are allowed (local dev).
     """
     required = _access_key()
     if not required:
         return True
-    parsed = urlparse(handler.path)
-    query = parse_qs(parsed.query)
-    # Check query parameter first (used by /token).
-    provided = query.get("key", [""])[0]
-    if provided and secrets.compare_digest(provided, required):
-        return True
-    # Check header (used by POST endpoints and frontend).
     header_value = handler.headers.get("X-Access-Key", "")
     if header_value and secrets.compare_digest(header_value, required):
         return True

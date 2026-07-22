@@ -488,8 +488,9 @@ function attachRoomEvents(room) {
 
 async function connectParticipant(role) {
   const params = new URLSearchParams({ role });
-  if (accessKey) params.set("key", accessKey);
-  const response = await fetch(`/token?${params}`);
+  const response = await fetch(`/token?${params}`, {
+    headers: authHeaders(),
+  });
   if (!response.ok) throw new Error(`Token request failed: ${response.status}`);
   const session = await response.json();
   const room = new Room({ adaptiveStream: true, dynacast: true });
