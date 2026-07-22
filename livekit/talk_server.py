@@ -246,6 +246,19 @@ def _voice_agent_reply(
                     transcription_args["prompt"] = stt_prompt
                 stt = agent.provider.client.audio.transcriptions.create(**transcription_args)
             transcript = (stt if isinstance(stt, str) else stt.text).strip()
+        if getattr(agent.provider, "name", "") != "mock" and _is_probable_stt_hallucination(transcript):
+            trace.event("stt.hallucination_suppressed", transcript=transcript)
+            return _finish_response(
+                agent,
+                trace,
+                "",
+                None,
+                transcript=transcript,
+                sttModel=getattr(agent.provider, "stt_model", "unknown"),
+                ignored=True,
+                ignoreReason="probable_stt_hallucination",
+                response_sources=[],
+            )
         if was_barge_in and _is_probable_playback_echo(transcript):
             trace.event("barge_in.echo_suppressed", transcript=transcript)
             return _finish_response(
@@ -284,6 +297,24 @@ def _is_probable_playback_echo(transcript: str) -> bool:
         "youre welcome",
         "your welcome",
     }
+
+
+_STT_HALLUCINATION_MARKERS = (
+    "www.", ".com", ".org", ".net",
+    "subtitle", "subtítulo", "amara.org",
+    "thanks for watching", "thank you for watching",
+)
+
+
+def _is_probable_stt_hallucination(transcript: str) -> bool:
+    """Heuristic filter for empty/near-empty audio and common Whisper
+    hallucination artifacts -- website/subtitle-credit text Whisper models
+    are known to emit for silence or non-speech audio -- so these aren't
+    sent to the LLM as if they were real caller speech."""
+    normalized = transcript.strip().lower()
+    if len(normalized) < 3:
+        return True
+    return any(marker in normalized for marker in _STT_HALLUCINATION_MARKERS)
 
 
 def _token(identity: str, name: str, room: str) -> str:

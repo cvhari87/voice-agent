@@ -6,7 +6,7 @@ import base64
 import unittest
 from contextlib import contextmanager
 
-from talk_server import _browser_tts_payload
+from talk_server import _browser_tts_payload, _is_probable_stt_hallucination
 
 
 class FakeTrace:
@@ -68,6 +68,30 @@ class BrowserTtsPayloadTests(unittest.TestCase):
         self.assertEqual(payload, {"ttsBackend": "browser", "ttsFallback": True})
         self.assertEqual(trace.events[0][0], "tts.fallback")
         self.assertNotIn("secret provider response", str(payload))
+
+
+class SttHallucinationFilterTests(unittest.TestCase):
+    def test_empty_and_near_empty_transcripts_are_filtered(self):
+        for text in ("", "   ", "a"):
+            with self.subTest(text=text):
+                self.assertTrue(_is_probable_stt_hallucination(text))
+
+    def test_known_whisper_hallucination_patterns_are_filtered(self):
+        """Whisper models are known to emit website/subtitle-credit text
+        for silence or non-speech audio -- reproduces an artifact actually
+        observed live in production."""
+        for text in (
+            "Más información www.alimmenta.com",
+            "Thanks for watching!",
+            "Subtitles by the Amara.org community",
+        ):
+            with self.subTest(text=text):
+                self.assertTrue(_is_probable_stt_hallucination(text))
+
+    def test_real_short_utterances_are_not_filtered(self):
+        for text in ("What are you doing?", "¡Gracias!", "If you need a"):
+            with self.subTest(text=text):
+                self.assertFalse(_is_probable_stt_hallucination(text))
 
 
 if __name__ == "__main__":
