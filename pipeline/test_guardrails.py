@@ -82,6 +82,26 @@ class GuardrailInputTests(unittest.TestCase):
         )
         self.assertTrue(decision.allowed)
 
+    def test_benign_context_only_neutralizes_the_overlapping_term(self):
+        """Benign context ("fire alarm policy", "fire extinguisher") must
+        only suppress the specific term occurrence it overlaps, not the
+        whole clause -- an independent real hazard elsewhere in the same
+        clause must still be examined."""
+        for text in (
+            "The fire alarm policy is fine but there is a fire",
+            "The fire extinguisher is missing but I cannot breathe",
+        ):
+            with self.subTest(text=text):
+                decision = self.guardrail.evaluate_input(text, "benign-scoped")
+                self.assertFalse(decision.allowed, text)
+                self.assertEqual(decision.category, "emergency", text)
+
+    def test_standalone_no_negates_an_emergency_term(self):
+        """A bare "no" (not just compound phrases like "do not have") must
+        be recognized as negation."""
+        decision = self.guardrail.evaluate_input("There is no fire", "bare-no")
+        self.assertTrue(decision.allowed)
+
 
 class EmergencyDetectionTests(unittest.TestCase):
     """Fix #3: clause-splitting and negation handling for emergency detection."""
@@ -596,6 +616,33 @@ class GuardrailToolTests(unittest.TestCase):
                 )
                 self.assertFalse(decision.allowed, text)
                 self.assertIn("not explicitly confirmed", decision.reason, text)
+
+    def test_rejection_without_a_confirmation_term_also_blocks_booking(self):
+        """"Cancel that"/"stop the booking" don't contain any recognized
+        confirmation word at all, so a plain "was a confirmation term
+        negated" check has nothing to attach to -- these must still be
+        recognized as rejections."""
+        availability = {
+            "check_in": "August 12", "check_out": "August 14",
+            "guests": 2, "room_type": "standard",
+        }
+        self.guardrail.evaluate_tool_call(
+            "check_availability", availability, "I need a room", "bare-rejection", 1, "availability-turn",
+        )
+        self.guardrail.process_availability_result(
+            "bare-rejection",
+            {"result": "Available rooms for August 12 to August 14: Standard Queen at $189/night."},
+        )
+        self.guardrail.evaluate_output(
+            "I have a Standard Queen available. Shall I book it?",
+            "bare-rejection",
+        )
+        for text in ("Yes, but cancel that", "Yes, but do not make the reservation", "Yes, actually stop the booking"):
+            with self.subTest(text=text):
+                decision = self.guardrail.evaluate_tool_call(
+                    "create_booking", self.booking, text, "bare-rejection", 1, "confirm-turn",
+                )
+                self.assertFalse(decision.allowed, text)
 
     def test_booking_rejects_invalid_fields(self):
         invalid = dict(self.booking, guests=-5, contact="not-contact")

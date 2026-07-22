@@ -3,13 +3,19 @@
 Deployed URL: https://voice-agent-production-8dbe.up.railway.app
 Access key (enter when prompted on page load): see `TALK_ACCESS_KEY` in Railway's Variables tab — never commit the real value here.
 
-Start screen recording before opening the URL. Keep the transcript, sources, and
-telemetry/pipeline panels visible in frame throughout — that's the evidence the
-demo needs to show, not just the audio.
+**Authenticate before you start recording, not after.** Open the URL and enter
+the access key first — the key prompt is a plain browser `prompt()` (not a
+password-masked field), so if it's on screen during a take, the key is
+visible in the recording. Get past that prompt, *then* start your screen
+recording. Also don't switch over to Railway's Variables tab mid-recording —
+that's a much bigger exposure than the prompt itself.
 
 ## 1. Connect
 
-- Open the URL, enter the access key when prompted.
+- (Before recording) open the URL, enter the access key when prompted.
+- Once past the prompt, start screen recording. Keep the transcript, sources,
+  and telemetry/pipeline panels visible in frame throughout — that's the
+  evidence the demo needs to show, not just the audio.
 - Click **Start call** once (grants mic permission).
 - Wait for both "Caller Demo" and "Aurora Agent" to show as joined.
 
