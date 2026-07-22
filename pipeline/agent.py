@@ -436,6 +436,11 @@ class Agent:
                     args = json.loads(tc.function.arguments or "{}")
                 except json.JSONDecodeError:
                     args = {}
+                if not isinstance(args, dict):
+                    # Some providers emit a literal "null" for zero-argument
+                    # tool calls (e.g. end_call); treat that as no arguments
+                    # rather than failing tool-schema validation.
+                    args = {}
                 trace.event("tool.requested", tool=tc.function.name, arguments=args)
                 with trace.span("tools", tool=tc.function.name):
                     tool_decision = self.guardrail.evaluate_tool_call(

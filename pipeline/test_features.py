@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import unittest
+from types import SimpleNamespace as NS
 from unittest.mock import patch
 
 os.environ["PROVIDER"] = "mock"
@@ -63,6 +64,34 @@ class RouterTests(unittest.TestCase):
         self.assertEqual(agent.current_language, "en")
         self.assertIn(
             "router.language_change_rejected",
+            [event["name"] for event in trace.events],
+        )
+
+
+class ToolArgumentParsingTests(unittest.TestCase):
+    def test_null_arguments_for_zero_arg_tool_do_not_exhaust_tool_budget(self):
+        """Groq's Llama tool-calling was observed emitting a literal JSON
+        "null" for a zero-argument call (end_call) instead of "{}". That
+        decoded to Python None, which the guardrail correctly rejected as
+        "not an object" -- but the model then retried the identical call
+        until it burned through the whole tool-round budget and got
+        force-transferred instead of hanging up. Null arguments must be
+        treated as no arguments."""
+        class NullArgsProvider(MockProvider):
+            def chat(self, messages, tools=None, tool_choice=None):
+                if messages[-1].get("role") == "user":
+                    tc = NS(id="call_1", type="function",
+                            function=NS(name="end_call", arguments="null"))
+                    return NS(choices=[NS(message=NS(content=None, tool_calls=[tc]))])
+                return super().chat(messages, tools=tools, tool_choice=tool_choice)
+
+        agent = Agent(NullArgsProvider())
+        trace = TurnTrace(session_id="test", turn_id="null-args")
+        reply, action = agent.respond("Goodbye", trace=trace)
+
+        self.assertEqual(action, "hangup")
+        self.assertNotIn(
+            "guardrail.tool_loop_stopped",
             [event["name"] for event in trace.events],
         )
 
