@@ -394,11 +394,27 @@ class Agent:
                         if first_model_call and required_tool
                         else None
                     )
-                resp = self.provider.chat(
-                    self.messages,
-                    tools=TOOLS,
-                    tool_choice=tool_choice,
-                )
+                try:
+                    resp = self.provider.chat(
+                        self.messages,
+                        tools=TOOLS,
+                        tool_choice=tool_choice,
+                    )
+                except Exception as exc:
+                    # Observed with Groq/Llama: the model occasionally emits
+                    # malformed native tool-call syntax (e.g. a missing ">"
+                    # before the JSON args), which the provider rejects with
+                    # a 400 rather than ever returning a response object. Left
+                    # unhandled, that exception propagates all the way to the
+                    # caller as a raw error. Degrade gracefully instead: ask
+                    # the caller to repeat rather than crashing the turn.
+                    trace.event(
+                        "llm.generation_failed",
+                        errorType=type(exc).__name__,
+                    )
+                    reply = "Sorry, I didn't catch that. Could you say that again?"
+                    self.messages.append({"role": "assistant", "content": reply})
+                    return reply, action
                 first_model_call = False
             msg = resp.choices[0].message
 

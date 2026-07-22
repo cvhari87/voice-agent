@@ -95,6 +95,30 @@ class ToolArgumentParsingTests(unittest.TestCase):
             [event["name"] for event in trace.events],
         )
 
+    def test_malformed_generation_degrades_gracefully(self):
+        """Groq's Llama tool-calling was observed emitting malformed native
+        function-call syntax (e.g. a missing ">" before the JSON args),
+        which the provider rejects with a raw exception rather than ever
+        returning a response. Left unhandled, that exception would propagate
+        all the way to the caller as a displayed error. It must instead
+        degrade to an apologetic spoken reply."""
+        class BrokenGenerationProvider(MockProvider):
+            def chat(self, messages, tools=None, tool_choice=None):
+                if messages[-1].get("role") == "user":
+                    raise RuntimeError("tool call validation failed: malformed function syntax")
+                return super().chat(messages, tools=tools, tool_choice=tool_choice)
+
+        agent = Agent(BrokenGenerationProvider())
+        trace = TurnTrace(session_id="test", turn_id="broken-gen")
+        reply, action = agent.respond("Please speak Spanish.", trace=trace)
+
+        self.assertIsNone(action)
+        self.assertIn("sorry", reply.lower())
+        self.assertIn(
+            "llm.generation_failed",
+            [event["name"] for event in trace.events],
+        )
+
 
 class ProviderConfigurationTests(unittest.TestCase):
     def test_blank_model_override_uses_provider_default(self):
