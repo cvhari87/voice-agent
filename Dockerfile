@@ -1,21 +1,15 @@
 FROM python:3.11-slim
 
-# portaudio19-dev + gcc: needed to build sounddevice/webrtcvad from
-# pipeline/requirements.txt. Only voice_loop.py (local-mic mode) actually
-# uses them; talk_server.py never imports them, but installing the
-# requirements files as-is (matching the RUNBOOK preflight) is simpler and
-# less likely to drift than hand-maintaining a deploy-only subset.
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    build-essential \
-    portaudio19-dev \
-    && rm -rf /var/lib/apt/lists/*
-
+# talk_server.py's actual import chain only needs requirements-server.txt
+# (see that file for why) -- no system packages or compilation needed, so
+# builds are fast and the image stays small. pipeline/requirements.txt and
+# livekit/requirements.txt (with sounddevice/webrtcvad/numpy/python-dotenv
+# for voice_loop.py's local-mic mode) are NOT installed here; they remain
+# the RUNBOOK's documented local-dev preflight sets, unrelated to this image.
 WORKDIR /app
 
-COPY pipeline/requirements.txt pipeline/requirements.txt
-COPY livekit/requirements.txt livekit/requirements.txt
-RUN pip install --no-cache-dir -r pipeline/requirements.txt \
-    && pip install --no-cache-dir -r livekit/requirements.txt
+COPY requirements-server.txt requirements-server.txt
+RUN pip install --no-cache-dir -r requirements-server.txt
 
 COPY pipeline pipeline
 COPY livekit livekit

@@ -1,0 +1,11 @@
+# Deploy-time dependencies for talk_server.py only.
+#
+# pipeline/requirements.txt and livekit/requirements.txt remain the RUNBOOK's
+# documented local-dev preflight sets (they include sounddevice/webrtcvad/
+# numpy/python-dotenv for voice_loop.py's local-mic mode). talk_server.py's
+# actual import chain (agent.py, providers.py, guardrails.py, knowledge.py,
+# router.py, telemetry.py, env_loader.py) never touches any of those -- it
+# only needs these two packages, both pure-Python/pre-built-wheel installs
+# with no system dependencies (no portaudio, no compiler) required.
+openai>=1.30
+livekit-api
