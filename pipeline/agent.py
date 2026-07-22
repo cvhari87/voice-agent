@@ -380,11 +380,20 @@ class Agent:
 
         while True:
             with trace.span("llm", model=getattr(self.provider, "llm_model", "unknown")):
-                tool_choice = (
-                    _named_tool_choice(required_tool)
-                    if first_model_call and required_tool
-                    else None
-                )
+                if action:
+                    # A terminal action (hangup/transfer) already fired this
+                    # turn. Some providers (observed with Groq/Llama) will
+                    # otherwise re-invoke the same terminal tool instead of
+                    # speaking, burning the tool-round budget. Force plain
+                    # text so the model can still localize the closing line
+                    # (e.g. Spanish) without calling another tool.
+                    tool_choice = "none"
+                else:
+                    tool_choice = (
+                        _named_tool_choice(required_tool)
+                        if first_model_call and required_tool
+                        else None
+                    )
                 resp = self.provider.chat(
                     self.messages,
                     tools=TOOLS,
