@@ -243,6 +243,31 @@ class AvailabilityValidationTests(unittest.TestCase):
         self.assertFalse(decision.allowed)
         self.assertIn("after check-in", decision.reason)
 
+    def test_unparseable_dates_rejected(self):
+        """Dates that don't parse at all must not silently pass validation."""
+        decision = self.guardrail.evaluate_tool_call(
+            "check_availability",
+            {"check_in": "someday", "check_out": "later", "guests": 2},
+            "I need a room",
+            "unparseable-date-test",
+            1,
+        )
+        self.assertFalse(decision.allowed)
+        self.assertIn("could not be understood", decision.reason)
+
+    def test_past_check_in_date_rejected(self):
+        """A check-in date before today must be rejected even if the dates
+        parse fine and are correctly ordered relative to each other."""
+        decision = self.guardrail.evaluate_tool_call(
+            "check_availability",
+            {"check_in": "2020-01-01", "check_out": "2020-01-02", "guests": 2},
+            "I need a room",
+            "past-date-test",
+            1,
+        )
+        self.assertFalse(decision.allowed)
+        self.assertIn("in the past", decision.reason)
+
     def test_same_date_checkin_checkout_rejected_on_booking(self):
         """Same check-in and check-out date must be rejected at booking."""
         decision = self.guardrail.evaluate_tool_call(
@@ -447,10 +472,34 @@ class SummaryPresentedTests(unittest.TestCase):
         state = self.guardrail._session_state.get("with-summary", {})
         self.assertEqual(state.get("stage"), "summary_presented")
 
-        decision = self.guardrail.evaluate_tool_call(
-            "create_booking", self.booking, "Yes, book it", "with-summary", 1, "turn-2",
+    def test_bare_acknowledgment_does_not_count_as_a_summary(self):
+        """A bare "Okay." satisfying this gate would let a booking proceed
+        without the caller ever actually hearing the room/rate -- the stage
+        must require concrete evidence (a price or room type), not just any
+        non-empty, non-flagged output."""
+        availability = {
+            "check_in": "August 12", "check_out": "August 14",
+            "guests": 2, "room_type": "standard",
+        }
+        self.guardrail.evaluate_tool_call(
+            "check_availability", availability, "I need a room", "bare-ack", 1, "turn-1",
         )
-        self.assertTrue(decision.allowed)
+        self.guardrail.process_availability_result(
+            "bare-ack",
+            {"result": "Available rooms for August 12 to August 14: Standard Queen at $189/night."},
+        )
+        self.guardrail.evaluate_output("Okay.", "bare-ack")
+        state = self.guardrail._session_state.get("bare-ack", {})
+        self.assertEqual(state.get("stage"), "availability_checked")
+
+        # A create_booking attempt right after the bare acknowledgment must
+        # still be blocked -- proving this isn't just an internal-state
+        # detail but actually prevents the booking from proceeding.
+        decision = self.guardrail.evaluate_tool_call(
+            "create_booking", self.booking, "Yes, book it", "bare-ack", 1, "turn-2",
+        )
+        self.assertFalse(decision.allowed)
+        self.assertIn("summary must be presented", decision.reason)
 
 
 class OutputGuardrailTests(unittest.TestCase):

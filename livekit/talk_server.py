@@ -299,10 +299,42 @@ def _is_probable_playback_echo(transcript: str) -> bool:
     }
 
 
-_STT_HALLUCINATION_MARKERS = (
-    "www.", ".com", ".org", ".net",
-    "subtitle", "subtítulo", "amara.org",
-    "thanks for watching", "thank you for watching",
+# Meaningful short utterances that must NOT be filtered even though they are
+# very short. These are common booking-flow responses.
+_VALID_SHORT_UTTERANCES = {
+    "no", "si", "sí", "ok", "yes", "ya", "go", "hi",
+}
+
+# Long, distinctive Whisper hallucination phrases for silence/non-speech --
+# safe to substring-match since real booking speech would never contain
+# these multi-word sequences.
+_KNOWN_HALLUCINATIONS = {
+    "thanks for watching",
+    "thank you for watching",
+    "please subscribe",
+    "like and subscribe",
+    "subtitles by the amara.org community",
+    "subtítulos por la comunidad de amara.org",
+}
+
+# Short/ambiguous hallucination outputs that MUST be exact-matched, not
+# substring-matched -- "you"/"bye" are common words inside completely normal
+# speech ("thank you", "goodbye") and would over-trigger as substrings.
+_EXACT_HALLUCINATIONS = {
+    "you",
+    "bye",
+    "the end",
+}
+
+# Patterns that indicate subtitle-credit / website-spam hallucinations.
+# These match specific structures, NOT bare domain suffixes.
+_HALLUCINATION_PATTERN_MARKERS = (
+    "www.",
+    "amara.org",
+    "subtitles by",
+    "subtítulos por",
+    "subscribe to",
+    "follow us on",
 )
 
 
@@ -310,11 +342,35 @@ def _is_probable_stt_hallucination(transcript: str) -> bool:
     """Heuristic filter for empty/near-empty audio and common Whisper
     hallucination artifacts -- website/subtitle-credit text Whisper models
     are known to emit for silence or non-speech audio -- so these aren't
-    sent to the LLM as if they were real caller speech."""
-    normalized = transcript.strip().lower()
-    if len(normalized) < 3:
+    sent to the LLM as if they were real caller speech.
+
+    Deliberately allows short meaningful utterances (no, sí, ok) and
+    text containing email addresses (.com, .org, .net) since those are
+    valid booking-flow inputs.
+    """
+    stripped = transcript.strip()
+    if not stripped:
         return True
-    return any(marker in normalized for marker in _STT_HALLUCINATION_MARKERS)
+    normalized = stripped.lower()
+    # Allow known meaningful short utterances.
+    if normalized in _VALID_SHORT_UTTERANCES:
+        return False
+    # Reject single non-word characters (punctuation artifacts).
+    if len(normalized) <= 1:
+        return True
+    # Reject known hallucination phrases -- substring match, not exact, since
+    # these are long/distinctive enough (unlike short words) that trailing
+    # punctuation or being embedded in a slightly longer generation
+    # ("Thanks for watching!") shouldn't let them slip through.
+    if any(phrase in normalized for phrase in _KNOWN_HALLUCINATIONS):
+        return True
+    # Short/ambiguous hallucinations ("you", "bye") must be an exact match
+    # (after stripping trailing punctuation) -- substring matching these
+    # would discard completely normal speech ("thank you", "goodbye").
+    if normalized.rstrip(".!?,;: ") in _EXACT_HALLUCINATIONS:
+        return True
+    # Reject subtitle/website-spam patterns.
+    return any(marker in normalized for marker in _HALLUCINATION_PATTERN_MARKERS)
 
 
 def _token(identity: str, name: str, room: str) -> str:

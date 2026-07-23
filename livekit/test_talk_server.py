@@ -93,6 +93,35 @@ class SttHallucinationFilterTests(unittest.TestCase):
             with self.subTest(text=text):
                 self.assertFalse(_is_probable_stt_hallucination(text))
 
+    def test_meaningful_short_booking_responses_are_kept(self):
+        """A prior version of this filter discarded anything under 3
+        characters, silently dropping "No", "OK", and "Sí" -- all common,
+        legitimate booking-flow answers."""
+        for text in ("No", "no", "Sí", "si", "OK", "ok", "Yes"):
+            with self.subTest(text=text):
+                self.assertFalse(_is_probable_stt_hallucination(text))
+
+    def test_email_addresses_are_not_filtered(self):
+        """A prior version of this filter treated any ".com"/".org"/".net"
+        substring as a hallucination marker, which discarded real email
+        addresses -- a required booking-flow input."""
+        for text in ("hari@example.com", "My email is hari@example.com", "contact@aurorahotel.org"):
+            with self.subTest(text=text):
+                self.assertFalse(_is_probable_stt_hallucination(text))
+
+    def test_short_hallucination_words_do_not_over_match_real_speech(self):
+        """"you" and "bye" are real hallucination outputs Whisper can emit
+        for silence, but they're also substrings of extremely common real
+        speech ("thank you", "goodbye") -- these must require an exact
+        match, not a substring match, unlike the longer/more distinctive
+        hallucination phrases."""
+        for text in ("Thank you very much", "Goodbye", "I need you to check availability", "At the end of my stay"):
+            with self.subTest(text=text):
+                self.assertFalse(_is_probable_stt_hallucination(text))
+        for text in ("you", "You.", "bye", "Bye!", "the end"):
+            with self.subTest(text=text):
+                self.assertTrue(_is_probable_stt_hallucination(text))
+
 
 if __name__ == "__main__":
     unittest.main()

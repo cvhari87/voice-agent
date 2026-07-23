@@ -144,6 +144,9 @@ _INJECTION_OUTPUT_MARKERS = (
     "jailbreak", "developer mode", "dan mode",
 )
 _FABRICATED_CONFIRMATION_RE = re.compile(r"\bAH-\d{3,}", re.IGNORECASE)
+# Evidence a room summary was actually spoken, not just any non-empty
+# output -- a genuine summary names a price or the room type it's for.
+_PRICE_MENTION_RE = re.compile(r"\$\d")
 
 # Date parsing formats, most specific first.
 _DATE_FORMATS = (
@@ -465,13 +468,18 @@ class GuardrailAgent:
                 ),
             )
 
-        # Advance booking state: if availability was checked and the model
-        # is now speaking (presenting options), advance to summary_presented.
+        # Advance booking state: only if availability was checked AND the
+        # output shows concrete evidence a summary was actually spoken (a
+        # price or the room type), not just any non-empty acknowledgment
+        # like "Okay." -- that alone previously satisfied this gate.
         state = self._session_state.get(session_id)
         if state and state.get("stage") == "availability_checked":
-            previous_stage = state["stage"]
-            state["stage"] = "summary_presented"
-            self.remember_change(session_id, "bookingStage", previous_stage, "summary_presented")
+            mentions_price = bool(_PRICE_MENTION_RE.search(text))
+            mentions_room_type = any(key in normalized for key in _ROOM_CAPACITY)
+            if mentions_price or mentions_room_type:
+                previous_stage = state["stage"]
+                state["stage"] = "summary_presented"
+                self.remember_change(session_id, "bookingStage", previous_stage, "summary_presented")
 
         return self._decision(
             session_id,
@@ -536,12 +544,16 @@ class GuardrailAgent:
         if guests is None or not 1 <= guests <= 20:
             return "guest count must be between 1 and 20"
 
-        # Date validation: parse and enforce checkout > checkin.
+        # Date validation: both dates must parse, check-in can't be in the
+        # past, and check-out must be after check-in.
         check_in_date = _parse_date(str(args["check_in"]).strip())
         check_out_date = _parse_date(str(args["check_out"]).strip())
-        if check_in_date and check_out_date:
-            if check_out_date <= check_in_date:
-                return "check-out date must be after check-in date"
+        if check_in_date is None or check_out_date is None:
+            return "check-in and check-out dates could not be understood"
+        if check_in_date < date.today():
+            return "check-in date is in the past"
+        if check_out_date <= check_in_date:
+            return "check-out date must be after check-in date"
 
         # Room capacity pre-check: if a room type is specified, reject early
         # when guest count exceeds its capacity.
@@ -587,9 +599,12 @@ class GuardrailAgent:
             return "check-in and check-out cannot be the same"
         check_in_date = _parse_date(check_in_str)
         check_out_date = _parse_date(check_out_str)
-        if check_in_date and check_out_date:
-            if check_out_date <= check_in_date:
-                return "check-out date must be after check-in date"
+        if check_in_date is None or check_out_date is None:
+            return "check-in and check-out dates could not be understood"
+        if check_in_date < date.today():
+            return "check-in date is in the past"
+        if check_out_date <= check_in_date:
+            return "check-out date must be after check-in date"
 
         contact = str(args["contact"]).strip()
         if not (_EMAIL_RE.fullmatch(contact) or _PHONE_RE.fullmatch(contact)):
