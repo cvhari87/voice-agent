@@ -6,6 +6,8 @@
 
 Unlike a pure local text-mode report, this run includes an actual **public deployment** with a real LiveKit room, real STT/TTS through the browser, and a recorded demo — not just `voice_loop.py --text`.
 
+> **Note on the telemetry below:** the recorded video above is a real browser session (mic audio, real STT) against the deployed app. The per-turn telemetry tables in this report (Runs 1–3) are **separate live verification runs** against the same deployment/codebase, made via direct API calls rather than the browser UI — they are not a transcript of the video. The video session's own on-disk telemetry (`logs/voice-events.jsonl` inside that container) isn't retrievable after the fact (no server filesystem access, and the container has since been redeployed multiple times for subsequent fixes) — the tables below demonstrate the same scenarios and code path with real, freshly-captured numbers instead.
+
 ## Stage completion matrix (RUNBOOK Stages 0–10)
 
 | Stage | Description | Status | Evidence |
@@ -69,9 +71,9 @@ Same scenarios re-verified cleanly against production after switching providers:
 
 ---
 
-## Run 3 — Clean 11-turn script against production (final config)
+## Run 3 — Separate live verification run against production (post-recording, API-driven)
 
-Run directly against the deployed production URL (not local), one continuous session, captured fresh immediately before writing this report. `TTS_BACKEND=provider` (real `tts-1` audio) — this is why TTS is the dominant per-turn cost below, consistent with what Run 2 already found.
+**Not the recorded video** (see note above) — this is a fresh, separate session run directly against the deployed production URL via direct API calls (text input, not the browser/mic), captured immediately before writing this report, to get real (not estimated) numbers for the same scenario shape. `TTS_BACKEND=provider` (real `tts-1` audio) — this is why TTS is the dominant per-turn cost below, consistent with what Run 2 already found.
 
 | # | Turn | Lang | Tool called | Source | Action | LLM (ms) | TTS (ms) | Total (ms) |
 |---|------|------|-------------|--------|--------|----------|----------|------------|
@@ -150,6 +152,7 @@ Every fix was re-verified against all previously-reported bypass phrases (no reg
 - **Acoustic echo can mimic a code bug.** A recording session produced garbled real-Whisper transcripts because the agent's own browser-TTS playback was picked up by the mic; every *actually* well-formed utterance in the same session was handled correctly — the fix was headphones, not code.
 - **Deliberately deferred** (lower-visibility than what was fixed, explicitly disclosed rather than silently skipped): "any model output advances booking-summary-presented state" (a bare "Okay." satisfies the gate), unparseable/past dates pass availability and booking validation, `talk_server.py` still returns raw exception text in three spots, no session cap/TTL on `_agent_sessions`, auth fails open if `TALK_ACCESS_KEY` is unset, dependencies remain unpinned.
 - **Leaked-key incident.** The real `TALK_ACCESS_KEY` value was briefly committed to `DEMO_SCRIPT.md` and pushed to the public repo. Rotated in Railway immediately (the action that actually neutralizes an exposed secret, independent of any git operation); the doc now references the Variables tab instead of a literal value.
+- **The telemetry/observability layer is local-filesystem-based, not production-durable.** `write_trace()` and `GuardrailMemory` both write JSONL to a relative path inside the container. That works for local development, where the file persists on disk across runs — but container filesystems on Railway (and PaaS platforms generally) are ephemeral: every redeploy destroys the old container and spins up a fresh one with an empty `logs/` directory. This is why the recorded demo's own telemetry couldn't be recovered for this report after subsequent fixes triggered further redeploys (see the note under Run 3). A production version of this system would need to ship telemetry to something outside the container's lifecycle — a log aggregation service, a database, or at minimum a persistent volume — rather than a local JSONL file.
 
 ## Artifacts
 
