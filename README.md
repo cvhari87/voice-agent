@@ -1,5 +1,9 @@
 # Assignment 2: Aurora Hotel Voice Agent
 
+**Live deployment:** https://voice-agent-production-8dbe.up.railway.app
+**Video demo:** https://www.loom.com/share/510d9537bfec47a6abaedae53958ffea
+**Run notes and evidence:** [RUN_REPORT.md](RUN_REPORT.md)
+
 Aurora is a practical hotel-reservations voice agent built for an FDE workshop. The project starts with a deterministic text agent and progressively adds a live model, business tools, local retrieval, multilingual routing, microphone audio, turn detection, telemetry, LiveKit rooms, evaluation, and capacity planning.
 
 The core cascade is:

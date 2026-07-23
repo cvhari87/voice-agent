@@ -6,16 +6,16 @@
 
 Unlike a pure local text-mode report, this run includes an actual **public deployment** with a real LiveKit room, real STT/TTS through the browser, and a recorded demo — not just `voice_loop.py --text`.
 
-> **Note on the telemetry below:** the recorded video above is a real browser session (mic audio, real STT) against the deployed app. Its own on-disk telemetry (`logs/voice-events.jsonl` inside that container) isn't retrievable after the fact — no server filesystem access, and the container has since been redeployed multiple times for subsequent fixes. Runs 1, 2, and 4 are separate live verification runs against the same deployment/codebase, via direct API calls rather than the browser UI. **Run 3 is different: it replays the video's actual caller turns**, reconstructed from its transcript, so that one genuinely corresponds to what's in the recording.
+> **Note on the telemetry below:** the recorded video above is a real browser session (mic audio, real STT) against the deployed app. Its own on-disk telemetry (`logs/voice-events.jsonl` inside that container) isn't retrievable after the fact — no server filesystem access, and the container has since been redeployed multiple times for subsequent fixes. Runs 1 and 2 are separate live verification runs against the same deployment/codebase, via direct API calls rather than the browser UI. **Run 3 is different: it replays the video's actual caller turns**, reconstructed from its transcript, so that one genuinely corresponds to what's in the recording.
 
 ## Stage completion matrix (RUNBOOK Stages 0–10)
 
 | Stage | Description | Status | Evidence |
 |---|---|---|---|
 | 0 | Progressive build explanation | ✅ | Architecture matches `caller audio → VAD/STT → AgentRouter → LLM → RAG/tools → TTS` throughout |
-| 1 | Deterministic text agent | ✅ | `smoke_test.py` PASS; 75/75 pipeline unittest |
+| 1 | Deterministic text agent | ✅ | `smoke_test.py` PASS; 78/78 pipeline unittest |
 | 2 | Live provider, same agent | ✅ | Groq (4 bugs found & fixed, Run 1) + OpenAI (verified clean, Run 2) |
-| 3 | Tools, RAG, guardrails, language routing | ✅ | Runs 3 & 4 below; 3 rounds of adversarial guardrail hardening |
+| 3 | Tools, RAG, guardrails, language routing | ✅ | Runs 2 & 3 below; 3 rounds of adversarial guardrail hardening |
 | 4 | Local voice cascade (real STT) | ✅ (via Stage 5/deployed demo) | Real Whisper STT exercised through the deployed browser demo rather than a separate local-mic CLI pass — see recorded demo |
 | 5 | LiveKit room | ✅ (public, not just local) | LiveKit Cloud project, deployed `talk_server.py`, recorded demo shows both participants joined |
 | 6 | Turn-taking & barge-in | ✅ | Recorded demo: `"Caller interrupted agent playback"` fired from real mic audio |
@@ -37,8 +37,8 @@ Unlike a pure local text-mode report, this run includes an actual **public deplo
 | Check | Result |
 |---|---|
 | `python3 smoke_test.py` | **PASS** (availability → booking → transfer → hangup) |
-| `python3 -m unittest test_features.py test_guardrails.py` (pipeline) | **75/75** |
-| `python3 -m unittest test_env_loader.py test_talk_server.py` (livekit) | **10/10** |
+| `python3 -m unittest test_features.py test_guardrails.py` (pipeline) | **78/78** |
+| `python3 -m unittest test_env_loader.py test_talk_server.py` (livekit) | **13/13** |
 | `python3 run_evals.py --suite all` (core + red-team) | **14/14** |
 | `python3 scale_check.py --dau 1000000` | matches RUNBOOK's ~5,556 peak concurrency |
 | `mocks/demo_call.py`, `--transfer`, `ivr_menu_mock.py` | all clean |
@@ -84,9 +84,9 @@ The video's own on-disk telemetry isn't recoverable (see note above), so this re
 | 5 | "Let's make a reservation." | en | — | — | 706 | 2792 | 3500 |
 | 6 | "Five guests, August 13th through 15th." | en | `check_availability` | — | 1422 | 2339 | 3767 |
 | 7 | "Yeah, this works." | en | — (asks for name/contact) | — | 616 | 1342 | 1960 |
-| 8 | "Hari. Phone number 913-456-789." | en | — (asks to confirm) | — | 1186 | 1820 | 3009 |
+| 8 | "Hari. Phone number 555-000-0000 (fake, from the demo)." | en | — (asks to confirm) | — | 1186 | 1820 | 3009 |
 | 9 | "My name is Hari." | en | `create_booking` **(blocked — see below)** | — | 1739 | 2176 | 3918 |
-| 10 | "Contact number 979-569-1293." | en | — (asks to confirm) | — | 787 | 3390 | 4180 |
+| 10 | "Contact number 555-111-2222 (fake, from the demo)." | en | — (asks to confirm) | — | 787 | 3390 | 4180 |
 | 11 | "Yes, this is correct." | en | `create_booking` **(succeeded)** | — | 1916 | 4758 | 6677 |
 
 **Two things this replay surfaced that the disclosed-limitations version of this report didn't have yet:**
@@ -95,29 +95,9 @@ The video's own on-disk telemetry isn't recoverable (see note above), so this re
 
 2. **A real bug, found by faithfully replaying this exact conversation, then fixed.** The first attempt at this replay (before the fix below) failed turn 11 entirely — `create_booking` was rejected with `reason: "unknown room type"`. Root cause: `check_availability` told the caller "Family Double Queen room available," and the model naturally echoed that exact display name back on `create_booking` — but the guardrail's room-type validator only recognized internal keys (`standard`/`king`/`suite`/`family`/`accessible`), not display names. `agent.py` already had a `_normalize_room_type()` that maps display names to internal keys, but it was only used inside `run_tool()`, which never ran because the guardrail rejected the call first. **This is very likely the actual reason the booking in the recorded video never completed** (the recording ends right after "Yes, this is correct." with no confirmation ever spoken). Fixed by duplicating the same normalization into `guardrails.py` (a circular import prevents just importing it from `agent.py`) and applying it everywhere `room_type` is checked or stored. Verified: the table above is from the *post-fix* replay, and it completes successfully:
 
-> "Your booking is confirmed! You have a Family Double Queen room for five guests from August 13th to 15th under the name Hari. Your confirmation number is **AH-4827**, and a confirmation has been sent to 979-569-1293."
+> "Your booking is confirmed! You have a Family Double Queen room for five guests from August 13th to 15th under the name Hari. Your confirmation number is **AH-4827**, and a confirmation has been sent to 555-111-2222 (fake, from the demo)."
 
 **Evidence the confirmation ID is tool-generated, not model-invented:** `AH-4827` is the mock `create_booking` tool's hardcoded deterministic return value (`pipeline/agent.py`) — identical on every successful booking regardless of guest name/dates — and the output guardrail (`_FABRICATED_CONFIRMATION_RE`) independently checks that any `AH-\d+`-shaped code in a reply only appears after `create_booking` actually ran.
-
----
-
-## Run 4 — Additional coverage (RAG grounding, full language round-trip)
-
-The video's own conversation didn't include policy questions, so this separate scripted run (API-driven, not the browser) exercises RAG grounding and a full English→Spanish→English round-trip with a courtesy-phrase check, using the same production deployment (post room-type fix):
-
-| # | Turn | Lang | Tool called | Source | Action | Total (ms) |
-|---|------|------|-------------|--------|--------|------------|
-| 1 | room request (2 guests) | en | `check_availability` | — | — | 10601 |
-| 2 | "What is the weather?" | en | — (guardrail redirect) | — | — | 2455 |
-| 3 | cancellation policy | en | `search_hotel_knowledge` | `#Cancellation` | — | 7811 |
-| 4 | "Please speak Spanish." | es | `set_language` | — | lang_changed | 3709 |
-| 5 | pet policy (ES) | es | `search_hotel_knowledge` | `#Pets` | — | 7793 |
-| 6 | "Switch back to English." | en | `set_language` | — | lang_changed | 3041 |
-| 7 | "¡Gracias!" | en | — (stayed EN ✓) | — | — | 1865 |
-| 8 | check-in time | en | `search_hotel_knowledge` | `#Check-In And Check-Out` | — | 4370 |
-| 9 | "Goodbye" | en | `end_call` | — | **hangup** (SIP BYE) | 3256 |
-
-Confirms: hybrid tool routing grounds every policy question with a visible source, "¡Gracias!" correctly does *not* flip the session back to Spanish (matches `explicit_language_request()`), and the call ends with a real hangup rather than a forced transfer.
 
 ---
 
@@ -153,7 +133,7 @@ Every fix was re-verified against all previously-reported bypass phrases (no reg
 - **Media layer:** LiveKit Cloud project (replaces the local Docker dev server; Agent Observability deliberately disabled — would ship real caller audio to a third party, inconsistent with this app's own telemetry-redaction defaults)
 - **Verified end-to-end via direct API calls against production:** auth gate (401 on missing/wrong key, 200 on correct), static asset scoping (path traversal to `.env`/`.py` blocked), a real grounded Groq/OpenAI turn, the header-only access-key transport, and the negation-fix guardrail decisions (`category: emergency` for the reported bypass phrases, confirmed live post-deploy each time)
 - **Image:** trimmed after a slow (~7 min) rebuild — `talk_server.py`'s actual import chain never needed `sounddevice`/`webrtcvad`/`numpy`/`python-dotenv` (only the local-mic CLI path does); dropped those plus the `apt-get build-essential`/`portaudio19-dev` step entirely. Rebuilds now take under 2 minutes.
-- **Recorded demo (this specific take):** English→Spanish→English switching and a booking attempt through to explicit caller confirmation (see Run 3 — the booking did not complete *within the recording* due to the room-type bug documented and fixed there). Policy grounding with visible sources and barge-in are separately verified in Run 4 and an earlier test session respectively, but are not both shown in this particular video — noted here explicitly rather than implied, since an earlier version of this line overstated what this specific recording contains.
+- **Recorded demo (this specific take):** English→Spanish→English switching and a booking attempt through to explicit caller confirmation (see Run 3 — the booking did not complete *within the recording* due to the room-type bug documented and fixed there). Policy grounding with visible sources (Run 2) and barge-in (an earlier test session) are separately verified, but are not both shown in this particular video — noted here explicitly rather than implied, since an earlier version of this line overstated what this specific recording contains.
 
 ## What the runs confirm
 

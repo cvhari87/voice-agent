@@ -106,6 +106,10 @@ def write_trace(trace: TurnTrace | dict) -> None:
     with _write_lock:
         with path.open("a", encoding="utf-8") as handle:
             handle.write(json.dumps(payload, ensure_ascii=True) + "\n")
+        # Self-healing: matches guardrails.py's GuardrailMemory -- this file
+        # can contain conversation-adjacent data, so it shouldn't stay
+        # world-readable just because of the umask at file-creation time.
+        os.chmod(path, 0o600)
 
 
 def format_trace(trace: TurnTrace | dict) -> str:

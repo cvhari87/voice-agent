@@ -7,5 +7,8 @@
 # router.py, telemetry.py, env_loader.py) never touches any of those -- it
 # only needs these two packages, both pure-Python/pre-built-wheel installs
 # with no system dependencies (no portaudio, no compiler) required.
-openai>=1.30
-livekit-api
+openai==2.46.0
+livekit-api==1.2.0
+# talk_server.py imports jwt directly (token minting); pinned explicitly
+# rather than relying on it arriving transitively via livekit-api.
+PyJWT==2.13.0
