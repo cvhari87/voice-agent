@@ -2,6 +2,356 @@
 
 Working log and plan for Assignment 2 (Voice Agent). Due Wednesday; target finish Tuesday.
 
+---
+
+## Architecture
+
+### Overall System Diagram
+
+```
+┌─────────────────────────────────────────────────────────────────────────────────┐
+│                              BROWSER CLIENT                                     │
+│  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐  ┌────────────────────┐   │
+│  │  talk.js     │  │ MediaRecorder│  │ Web Audio    │  │  LiveKit Client    │   │
+│  │  (UI + flow) │  │ (mic capture)│  │ (VAD/levels) │  │  (room signaling)  │   │
+│  └──────┬───────┘  └──────┬───────┘  └──────┬───────┘  └────────┬───────────┘   │
+│         │                 │                 │                    │               │
+│         └─────────────────┴─────────────────┴────────────────────┘               │
+│                                     │  HTTP POST /voice-agent                   │
+│                                     │  (audio blob + headers)                   │
+└─────────────────────────────────────┼───────────────────────────────────────────┘
+                                      │
+                              ┌───────▼───────┐
+                              │  talk_server   │  ← Layer C: HTTP bridge
+                              │  (Python HTTP) │     session registry,
+                              │  port $PORT    │     auth gate, body limits
+                              └───┬───────┬───┘
+                                  │       │
+                    ┌─────────────┘       └─────────────┐
+                    │                                   │
+           ┌────────▼────────┐                ┌─────────▼──────────┐
+           │  STT (Whisper)  │                │  LiveKit Cloud     │
+           │  via Provider   │                │  (room server,     │
+           │                 │                │   WebRTC/ICE/TURN) │
+           └────────┬────────┘                └────────────────────┘
+                    │ transcript
+           ┌────────▼──────────────────────────────────────────────────────┐
+           │                    AGENT PIPELINE (Layer B)                    │
+           │                                                               │
+           │  ┌─────────────┐    ┌──────────────┐    ┌──────────────────┐  │
+           │  │ GuardrailAgt│───▶│    Agent      │───▶│  AgentRouter     │  │
+           │  │  (pre-LLM)  │    │  (LLM + tool  │    │  (language state) │  │
+           │  │ emergency,  │    │   loop)       │    │  en ↔ es          │  │
+           │  │ privacy,    │    │              │    └──────────────────┘  │
+           │  │ input length│    │              │                          │
+           │  └─────────────┘    │              │    ┌──────────────────┐  │
+           │                     │  ┌─────────┐ │    │   KnowledgeBase  │  │
+           │                     │  │ Provider│ │    │   (FTS5 + BM25)  │  │
+           │                     │  │ Groq /  │ │    │   hotel_policies │  │
+           │                     │  │ OpenAI /│ │◀──▶│   .md → chunks   │  │
+           │                     │  │ Mock    │ │    └──────────────────┘  │
+           │                     │  └─────────┘ │                          │
+           │                     │              │    ┌──────────────────┐  │
+           │                     │   tool calls │    │   TurnTrace      │  │
+           │                     │   ──────────▶│───▶│   (telemetry)    │  │
+           │                     │              │    │   JSONL events   │  │
+           │  ┌─────────────┐    │              │    └──────────────────┘  │
+           │  │ GuardrailAgt│◀───│   model reply│                          │
+           │  │  (post-LLM) │    │              │                          │
+           │  │ leak detect, │    └──────────────┘                          │
+           │  │ fabrication, │                                              │
+           │  │ injection    │                                              │
+           │  └─────────────┘                                              │
+           └───────────────────────────────────────────────────────────────┘
+                    │ reply + action + trace
+           ┌────────▼────────┐
+           │  TTS (provider  │
+           │  or browser     │
+           │  fallback)      │
+           └────────┬────────┘
+                    │ JSON response (+ optional base64 audio)
+                    ▼
+              back to browser
+```
+
+### Layered Architecture (A / B / C)
+
+The system is organized into three layers, each with a distinct responsibility:
+
+| Layer | Name | Files | Responsibility |
+|-------|------|-------|---------------|
+| **A** | Voice Loop | [`voice_loop.py`](pipeline/voice_loop.py), [`talk.js`](livekit/web/talk.js) | Mic capture → VAD endpointing → STT → (hand to B) → TTS → speaker. Turn-level timing. Two implementations: CLI (local mic via `sounddevice`/`webrtcvad`) and browser (Web Audio API + MediaRecorder). |
+| **B** | Agent Pipeline | [`agent.py`](pipeline/agent.py), [`guardrails.py`](pipeline/guardrails.py), [`router.py`](pipeline/router.py), [`knowledge.py`](pipeline/knowledge.py), [`providers.py`](pipeline/providers.py), [`telemetry.py`](pipeline/telemetry.py) | The "brain." LLM + tool loop, deterministic guardrails (input/tool/output), language routing, RAG retrieval, structured telemetry. Provider-agnostic — only talks to `Provider.chat()`. |
+| **C** | Transport / Bridge | [`talk_server.py`](livekit/talk_server.py), LiveKit Cloud, [`Dockerfile`](Dockerfile) | HTTP bridge serving the browser client, session management, auth gating, LiveKit room token minting. In production telephony: SIP/RTP termination (mocked in [`demo_call.py`](mocks/demo_call.py) and [`sip-ivr-call-flow.md`](mocks/sip-ivr-call-flow.md)). |
+
+### Cascading Architecture vs. Non-Cascading
+
+This system uses a **cascading (waterfall) pipeline** — each stage feeds its output to the next in a strict sequence. This was a deliberate choice over the alternatives:
+
+```
+┌──────────────────────────── CASCADING (what we built) ─────────────────────────────┐
+│                                                                                     │
+│   Audio ──▶ VAD ──▶ STT ──▶ Guardrails ──▶ LLM ──▶ Tools ──▶ Guardrails ──▶ TTS   │
+│                     (in)     (input)               (loop)     (output)              │
+│                                                                                     │
+│   Each stage completes fully before the next begins.                                │
+│   The LLM+tool section is an internal loop (up to 6 rounds), but each round         │
+│   still cascades: model call → tool execution → model call → ... → final text.      │
+│                                                                                     │
+└─────────────────────────────────────────────────────────────────────────────────────┘
+
+┌──────────────── NON-CASCADING alternatives (what we did NOT build) ─────────────────┐
+│                                                                                      │
+│   Streaming / parallel architecture:                                                 │
+│   - Partial STT results fed to LLM while still speaking (speculative execution)      │
+│   - LLM token streaming piped directly to TTS (chunk-by-chunk synthesis)             │
+│   - Parallel tool calls executed concurrently                                        │
+│   - "Thinking while listening" — overlapping capture and inference                   │
+│                                                                                      │
+└──────────────────────────────────────────────────────────────────────────────────────┘
+```
+
+**Why cascading was the right choice here:**
+
+1. **Guardrail integrity.** The deterministic guardrails in [`guardrails.py`](pipeline/guardrails.py) operate at three checkpoints — *before* the LLM sees input, *between* each tool call, and *after* the LLM produces output. A streaming/parallel design would let content bypass these gates (e.g., partial STT fed to the LLM before emergency detection runs, or streamed LLM tokens reaching the caller before the output guardrail catches a system-prompt leak). The cascading design guarantees every byte passes through every checkpoint.
+
+2. **Correctness over latency.** A hotel booking agent handles money and commitments. The booking state machine in [`guardrails.py`](pipeline/guardrails.py:167) (`empty → availability_pending → availability_checked → summary_presented → booking_authorized → booked`) requires that each stage's result is fully verified before the next begins. Speculative execution would risk advancing booking state on a partial transcript that changes meaning once complete (e.g., "I want to book" → "I want to book... actually never mind").
+
+3. **Tool-loop safety.** The LLM+tool loop in [`agent.py`](pipeline/agent.py:381) can run up to 6 rounds (enforced by the [`tool_budget` guardrail](pipeline/guardrails.py:307)). Each round's tool result feeds back into the next model call. Parallelizing tool execution would break the sequential state dependencies (e.g., `check_availability` must complete and be verified before `create_booking` is even considered).
+
+4. **Debugging.** The structured telemetry in [`telemetry.py`](pipeline/telemetry.py) produces an ordered event timeline per turn. A cascading design means the timeline is always `routing → input guardrail → LLM → tool → tool guardrail → LLM → output guardrail → TTS` — easy to read, easy to correlate with bugs. A parallel design would produce interleaved, non-deterministic timelines.
+
+**What we sacrifice:** ~200–400ms of latency per turn compared to a streaming design that pipelines STT→LLM→TTS. The [`format_trace()`](pipeline/telemetry.py:111) output shows where time goes (STT, LLM, tools, TTS as separate line items), and the dominant cost is the LLM call, not the cascading overhead.
+
+### Key Design Decisions
+
+#### 1. Provider Abstraction — [`providers.py`](pipeline/providers.py)
+
+```
+                    ┌──────────────┐
+                    │  Provider    │  .chat()  .transcribe()  .synthesize()
+                    │  (abstract)  │
+                    └──────┬───────┘
+                           │
+            ┌──────────────┼──────────────┐
+            │              │              │
+     ┌──────▼──────┐ ┌────▼─────┐ ┌──────▼──────┐
+     │    Groq     │ │  OpenAI  │ │    Mock     │
+     │ llama-3.3   │ │ gpt-4o   │ │ rule-based  │
+     │ whisper-lg  │ │ whisper-1│ │ scripted    │
+     │ orpheus-tts │ │ tts-1    │ │ no-op tts   │
+     └─────────────┘ └──────────┘ └─────────────┘
+```
+
+**Decision:** Single `Provider` class with Groq/OpenAI presets, plus a `MockProvider` with the identical interface — not a formal ABC or plugin system.
+
+**Why:** Both Groq and OpenAI speak the OpenAI API dialect (same SDK, same `chat.completions.create` signature, same tool-calling schema). A formal interface with registration/discovery would add complexity for zero benefit — switching providers is a single env var (`PROVIDER=groq|openai|mock`). The `MockProvider` is rule-based (keyword matching, not an LLM), which is critical: it lets the eval suite run 14 scenarios with zero API cost, zero network, zero non-determinism.
+
+**What we rejected:** Separate provider classes with a registry pattern. Also rejected LangChain/LlamaIndex abstractions — they add dependency weight and abstraction layers that would obscure the direct API interactions this workshop is designed to teach.
+
+#### 2. Deterministic Guardrails Before/After the LLM — [`guardrails.py`](pipeline/guardrails.py)
+
+```
+  caller text
+       │
+       ▼
+  ┌────────────────────────┐
+  │  INPUT GUARDRAIL       │  ← runs BEFORE the LLM
+  │  • emergency detection │     (deterministic, no API call)
+  │  • privacy screening   │
+  │  • input length cap    │
+  └────────┬───────────────┘
+           │ allowed?
+     ┌─────┴─────┐
+     │ NO        │ YES
+     ▼           ▼
+  immediate    LLM + tool loop
+  response        │
+  (transfer)      │  each tool call:
+                  ▼
+           ┌─────────────────────────────┐
+           │  TOOL GUARDRAIL             │  ← runs PER tool call
+           │  • tool budget (max 6)      │     (deterministic)
+           │  • schema validation        │
+           │  • booking state machine    │
+           │  • date/capacity/contact    │
+           │  • confirmation negation    │
+           │  • duplicate fingerprinting │
+           └──────────┬──────────────────┘
+                      │ model produces text
+                      ▼
+           ┌─────────────────────────────┐
+           │  OUTPUT GUARDRAIL           │  ← runs AFTER the LLM
+           │  • system prompt leakage    │     (deterministic)
+           │  • injection markers        │
+           │  • fabricated confirmations  │
+           │  • booking summary tracking │
+           └──────────┬──────────────────┘
+                      │
+                      ▼
+                 to caller
+```
+
+**Decision:** All guardrails are deterministic (regex, word-boundary matching, state machine transitions) — no LLM-based content moderation.
+
+**Why:** An LLM-based guardrail (e.g., "ask GPT to judge if this is safe") adds latency (another API round trip), cost (tokens), and non-determinism (the judge LLM can be manipulated by the same adversarial input it's supposed to catch). Deterministic checks are O(1), free, and testable with exact assertions. The 74 unit tests in [`test_guardrails.py`](pipeline/test_guardrails.py) verify every bypass that was found and fixed — that kind of exhaustive regression testing is only possible because the guardrail logic is pure functions over strings, not probabilistic model outputs.
+
+**What we rejected:** OpenAI's Moderation API, a second "judge" LLM call, or any guardrail that requires network/cost/latency. Also rejected moving guardrail logic into the system prompt alone — prompt-only guardrails are advisory, not enforced. The system prompt still has guardrail instructions (so the LLM cooperates), but the deterministic layer is the enforcement mechanism.
+
+#### 3. RAG via SQLite FTS5 — [`knowledge.py`](pipeline/knowledge.py)
+
+```
+  knowledge/hotel_policies.md
+       │
+       │  _chunks_from_markdown()
+       │  split on ## headings
+       ▼
+  ┌──────────────────────┐
+  │  SQLite :memory:     │
+  │  FTS5 virtual table  │
+  │  BM25 ranking        │
+  └──────────┬───────────┘
+             │  .search(query)
+             │  stop-word removal
+             │  cross-language expansion
+             │  (cancelación → cancellation)
+             ▼
+  top-3 chunks with [section] + text
+  returned as grounded context
+```
+
+**Decision:** In-memory SQLite FTS5 with BM25 scoring, not a vector database.
+
+**Why:** The knowledge base is a single Markdown file (~20 sections). A vector DB (Pinecone, Chroma, Weaviate) would add: an embedding model dependency, an external service or local process, a vector index that needs rebuilding on content changes, and latency for embedding the query at search time. FTS5 is built into Python's `sqlite3` module — zero dependencies, sub-millisecond search, and BM25 relevance ranking that's more than adequate for 20 chunks. The cross-language query expansion (Spanish → English synonyms via a static map) handles the bilingual requirement without needing multilingual embeddings.
+
+**What we rejected:** Any vector database or embedding-based retrieval. Also rejected loading the entire policy document into the system prompt — that wastes context window tokens on every turn (even when the caller asks about room rates, not cancellation policy) and makes the prompt brittle as policies grow.
+
+#### 4. Browser-Side VAD + Barge-In — [`talk.js`](livekit/web/talk.js)
+
+```
+  ┌─────────────────────────────────────────────────────┐
+  │                  Browser (talk.js)                   │
+  │                                                     │
+  │  mic → AudioContext → AnalyserNode → energy check   │
+  │                                        │            │
+  │                         ┌──────────────┴──────────┐ │
+  │                         │ speech detected?        │ │
+  │                         │ energy > threshold for  │ │
+  │                         │ N consecutive frames    │ │
+  │                         └──────────┬──────────────┘ │
+  │                                    │                │
+  │                         ┌──────────▼──────────────┐ │
+  │                         │ is agent speaking?      │ │
+  │                         │ YES → barge-in:         │ │
+  │                         │   stop TTS playback     │ │
+  │                         │   set X-Barge-In: true  │ │
+  │                         │ NO → normal turn start  │ │
+  │                         └──────────┬──────────────┘ │
+  │                                    │                │
+  │  MediaRecorder → webm blob → POST /voice-agent     │
+  │                                    │                │
+  │  server checks _is_probable_stt_hallucination()     │
+  │  server checks _is_probable_playback_echo()         │
+  │                  (if barge-in)                      │
+  └─────────────────────────────────────────────────────┘
+```
+
+**Decision:** Energy-based VAD in the browser, with server-side STT hallucination filtering, rather than server-side VAD or WebRTC VAD.
+
+**Why:** The CLI path uses `webrtcvad` (C library, needs `portaudio`), which can't run in a browser. The browser's Web Audio API provides `AnalyserNode` with real-time frequency/energy data — enough for a simple energy-threshold VAD that detects speech onset and silence for endpointing. The server then filters Whisper hallucination artifacts (common phrases Whisper emits for silence: "Thanks for watching", "Subscribe", subtitle credits) via [`_is_probable_stt_hallucination()`](livekit/talk_server.py:341) before the transcript reaches the agent.
+
+#### 5. Deployment Topology — Railway + LiveKit Cloud
+
+```
+  ┌────────────┐          ┌───────────────────────────────┐
+  │  Browser   │──HTTPS──▶│  Railway (talk_server.py)     │
+  │  (caller)  │          │  • static files (web/)        │
+  │            │          │  • /agent, /voice-agent,      │
+  │            │          │    /greeting, /token, /reset   │
+  │            │◀─────────│  • Groq API calls (LLM/STT)   │
+  │            │          │  • auth: X-Access-Key header   │
+  │            │          └──────────────┬────────────────┘
+  │            │                         │
+  │            │          ┌──────────────▼────────────────┐
+  │            │◀─WebRTC─▶│  LiveKit Cloud                │
+  │            │          │  (room server, ICE/TURN,      │
+  │            │          │   WebRTC media relay)          │
+  │            │          └───────────────────────────────┘
+  └────────────┘
+```
+
+**Decision:** Railway for the app server, LiveKit Cloud for the room server. Not a single self-hosted deployment.
+
+**Why:** The hard problem in deploying a WebRTC application is ICE/TURN — the NAT traversal that lets browser audio reach a server behind firewalls. Self-hosting a LiveKit server (the local Docker dev setup) requires public UDP ports, a TURN server, and TLS certificates for the WebSocket signaling. LiveKit Cloud solves all of this on their free tier. Railway handles the stateful HTTP server (`talk_server.py` holds `_agent_sessions` in memory across requests) — Vercel was rejected because it's designed for stateless serverless functions, incompatible with the session-registry pattern.
+
+**What we rejected:** Vercel (wrong execution model for stateful long-running processes), self-hosted LiveKit (UDP/TURN complexity exceeds a course assignment's scope), Fly.io (viable but the user already had a Railway hobby plan).
+
+#### 6. Session & Booking State Machine — [`guardrails.py`](pipeline/guardrails.py:167)
+
+```
+  ┌─────────┐   check_availability   ┌─────────────────────┐  result verified  ┌──────────────────────┐
+  │  empty  │ ──────────────────────▶ │ availability_pending │ ───────────────▶ │ availability_checked │
+  └─────────┘   (guardrail allows)   └─────────────────────┘  (rooms found)    └──────────┬───────────┘
+       ▲                                       │                                          │
+       │                                no rooms found                           agent speaks prices
+       │                                       │                                or room types
+       │                                       ▼                                          │
+       └───────────────────────────────── (reset)                              ┌──────────▼───────────┐
+                                                                               │ summary_presented    │
+                                                                               └──────────┬───────────┘
+                                                                                          │
+                                                                               caller confirms
+                                                                               (not negated)
+                                                                                          │
+                                                                               ┌──────────▼───────────┐
+                                                                               │ booking_authorized   │
+                                                                               └──────────┬───────────┘
+                                                                                          │
+                                                                               create_booking succeeds
+                                                                                          │
+                                                                               ┌──────────▼───────────┐
+                                                                               │       booked         │
+                                                                               └──────────────────────┘
+```
+
+**Decision:** Explicit state machine with named stages, enforced by the guardrail layer — not implicit LLM memory.
+
+**Why:** If booking state is only tracked in the LLM's conversation history, the model can skip steps (jump from "what rooms do you have?" straight to emitting a `create_booking` call without ever showing the caller prices), hallucinate confirmation codes, or let a manipulated input ("Yes, but do not book it") authorize a booking. The state machine forces the correct sequence: availability must be checked *and verified* (rooms actually returned), a summary must be *spoken* (with prices or room types, not just "Okay"), and the caller must *explicitly confirm* (with negation-aware parsing) before `create_booking` is allowed.
+
+### Data Flow — A Complete Turn
+
+```
+  1. Browser captures audio via MediaRecorder
+  2. POST /voice-agent with audio blob, session-id, turn-id, barge-in flag
+  3. talk_server.py:
+     a. Auth check (X-Access-Key header vs TALK_ACCESS_KEY env)
+     b. Body size check (MAX_BODY_BYTES = 10MB)
+     c. Session lookup/create → Agent instance + per-session lock
+     d. STT: provider.client.audio.transcriptions.create() → transcript
+     e. Hallucination filter: _is_probable_stt_hallucination()
+     f. Echo filter (if barge-in): _is_probable_playback_echo()
+  4. agent.respond(transcript, trace):
+     a. Router: resolve current language → update system prompt
+     b. Input guardrail: emergency? privacy? too long?
+        → if blocked: return immediately (no LLM call)
+     c. Deterministic tool routing: required_tool_for(text)
+        → if knowledge intent detected: force tool_choice
+     d. LLM call (with retry): provider.chat(messages, tools, tool_choice)
+     e. If tool calls returned:
+        → tool guardrail per call (budget, schema, booking state)
+        → execute tool (check_availability, create_booking, etc.)
+        → append tool result to messages
+        → loop back to (d) — up to 6 rounds
+     f. If terminal action (hangup/transfer) already set:
+        → force tool_choice="none" on next LLM call
+     g. Output guardrail on final text: leakage? injection? fabrication?
+  5. TTS: provider.synthesize(reply) → audio bytes (or browser fallback)
+  6. JSON response: { reply, action, trace, sources, audioBase64?, ... }
+  7. Browser: play audio, update transcript/telemetry panels
+```
+
+---
+
 ## Completed
 
 1. **Cloned the assignment.** Pulled `FDE/Assignment_2_voice_agent` from `hamzafarooq/multi-agent-course` (the local checkout was 4 commits behind `origin/main`, which is where this assignment actually lives) and copied it into `Voice Agent/` as its own working folder.
