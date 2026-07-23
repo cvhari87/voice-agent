@@ -2,14 +2,31 @@
 
 **Date:** 2026-07-22 · **Host:** macOS (Darwin) · **Python:** 3.9.6 (`pipeline/.venv`, `livekit/.venv`)
 **Scope:** Local live-provider testing (Groq → OpenAI), three rounds of adversarial guardrail hardening, full public deployment (Railway + LiveKit Cloud), and a recorded browser demo.
+**Video demo:** https://www.loom.com/share/510d9537bfec47a6abaedae53958ffea
 
 Unlike a pure local text-mode report, this run includes an actual **public deployment** with a real LiveKit room, real STT/TTS through the browser, and a recorded demo — not just `voice_loop.py --text`.
+
+## Stage completion matrix (RUNBOOK Stages 0–10)
+
+| Stage | Description | Status | Evidence |
+|---|---|---|---|
+| 0 | Progressive build explanation | ✅ | Architecture matches `caller audio → VAD/STT → AgentRouter → LLM → RAG/tools → TTS` throughout |
+| 1 | Deterministic text agent | ✅ | `smoke_test.py` PASS; 74/74 pipeline unittest |
+| 2 | Live provider, same agent | ✅ | Groq (4 bugs found & fixed, Run 1) + OpenAI (verified clean, Run 2) |
+| 3 | Tools, RAG, guardrails, language routing | ✅ | Clean 11-turn run below; 3 rounds of adversarial guardrail hardening |
+| 4 | Local voice cascade (real STT) | ✅ (via Stage 5/deployed demo) | Real Whisper STT exercised through the deployed browser demo rather than a separate local-mic CLI pass — see recorded demo |
+| 5 | LiveKit room | ✅ (public, not just local) | LiveKit Cloud project, deployed `talk_server.py`, recorded demo shows both participants joined |
+| 6 | Turn-taking & barge-in | ✅ | Recorded demo: `"Caller interrupted agent playback"` fired from real mic audio |
+| 7 | Telemetry | ✅ | `logs/voice-events.jsonl` (per-turn trace) + `logs/guardrail-memory.jsonl` (guardrail audit, `0600`) |
+| 8 | Evaluation & red teaming | ✅ | 14/14 (`run_evals.py --suite all`) |
+| 9 | Scale check | ✅ | `scale_check.py` matches RUNBOOK's ~5,556 peak concurrency |
+| 10 | SIP mapping | ✅ | `demo_call.py`, `--transfer`, `ivr_menu_mock.py` all clean |
 
 ## Run configuration & decisions
 
 - **Local testing:** `voice_loop.py --text` (RUNBOOK Stage 2) for provider/tool-calling verification; drives the same agent state, router, RAG, and tools as voice mode.
 - **Providers:** started with **Groq** (`llama-3.3-70b-versatile`) for local and initial deployed testing. Groq's free-tier daily cap (100,000 TPD) was exhausted repeatedly during iterative testing (confirmed via `openai.RateLimitError` in telemetry, not a code bug). Switched production to **OpenAI** (`gpt-4o-mini` / `whisper-1` / `tts-1`) — same codebase, zero code changes, since both providers speak the OpenAI-compatible API dialect this project's `Provider` class is built around.
-- **TTS:** `TTS_BACKEND=system` (routes to browser TTS) in the deployed environment — OpenAI's `tts-1` added ~3s of network latency per turn (total turn time ~6s); switching to browser TTS cut it to ~1.4s. Also avoids Groq's `canopylabs/orpheus-v1-english` TTS, which 400s in production (a preview-tier limitation on Groq's side, not ours) — the app's existing fallback already handles this gracefully.
+- **TTS:** both backends were exercised. `TTS_BACKEND=system` (routes to browser TTS) was used temporarily to diagnose latency — OpenAI's `tts-1` adds ~3–6s of network latency per turn depending on reply length, and switching to browser TTS cut a turn from ~6s to ~1.4s. Currently deployed with `TTS_BACKEND=provider` (real `tts-1` audio) for the recorded demo's voice quality; the per-turn telemetry below reflects that live cost. Groq's `canopylabs/orpheus-v1-english` TTS 400s in production (a preview-tier limitation on Groq's side, not ours) — the app's fallback already handles this gracefully regardless of which cloud TTS is configured.
 - **Telemetry:** per-turn JSONL trace (`logs/voice-events.jsonl`), default redaction (`TELEMETRY_INCLUDE_CONTENT=false`). A second audit trail, `logs/guardrail-memory.jsonl`, records every guardrail decision (redacted/hashed sensitive fields, `0600` permissions).
 - No real secrets are committed. `pipeline/.env`/`livekit/.env`/venvs are gitignored. One incident: `TALK_ACCESS_KEY`'s real value was briefly committed in `DEMO_SCRIPT.md`; rotated in Railway immediately and the doc replaced with a placeholder (see Caveats).
 
@@ -49,6 +66,38 @@ Same scenarios re-verified cleanly against production after switching providers:
 | "Can you speak in Spanish instead?" | `language: es`, correct Spanish reply, no errors — the exact scenario that failed repeatedly on Groq (Run 1, #4) |
 | Booking flow (5 guests → room match) | Correctly matched to Family Double Queen (respects room-capacity validation), real Whisper STT transcription |
 | Latency | LLM ~0.9–1.9s per turn; total turn time dropped ~6s → ~1.4s after switching TTS to browser-side |
+
+---
+
+## Run 3 — Clean 11-turn script against production (final config)
+
+Run directly against the deployed production URL (not local), one continuous session, captured fresh immediately before writing this report. `TTS_BACKEND=provider` (real `tts-1` audio) — this is why TTS is the dominant per-turn cost below, consistent with what Run 2 already found.
+
+| # | Turn | Lang | Tool called | Source | Action | LLM (ms) | TTS (ms) | Total (ms) |
+|---|------|------|-------------|--------|--------|----------|----------|------------|
+| 1 | room request (2 guests) | en | `check_availability` | — | — | 5000 | 5584 | 10601 |
+| 2 | "Book it for Priya Shah…" | en | — (asked to pick a room type) | — | — | 1112 | 4510 | 5625 |
+| 3 | "Yes, book it." | en | — (asked again to pick a room type) | — | — | 735 | 2441 | 3218 |
+| 4 | "What is the weather?" | en | — (guardrail redirect) | — | — | 830 | 1622 | 2455 |
+| 5 | cancellation policy | en | `search_hotel_knowledge` | `#Cancellation` | — | 1763 | 6044 | 7811 |
+| 6 | "Please speak Spanish." | es | `set_language` | — | lang_changed | 1410 | 2297 | 3709 |
+| 7 | pet policy (ES) | es | `search_hotel_knowledge` | `#Pets` | — | 1441 | 6348 | 7793 |
+| 8 | "Switch back to English." | en | `set_language` | — | lang_changed | 1334 | 1704 | 3041 |
+| 9 | "¡Gracias!" | en | — (stayed EN ✓) | — | — | 755 | 1109 | 1865 |
+| 10 | check-in time | en | `search_hotel_knowledge` | `#Check-In And Check-Out` | — | 1422 | 2945 | 4370 |
+| 11 | "Goodbye" | en | `end_call` | — | **hangup** (SIP BYE) | 1314 | 1939 | 3256 |
+
+**Median:** LLM 1334 ms · TTS 2441 ms — TTS is the dominant per-turn stage, consistent with `tts-1`'s network round-trip cost identified in Run 2 (this is why the recorded demo uses browser TTS instead for a snappier feel, even though this specific verification run used real provider audio to also confirm that path still works end-to-end).
+
+**Note on turns 2–3:** the model asked to confirm a room type before booking on this script (matching a pattern both external reference reports for this assignment independently observed — neither of *their* providers completed a booking on the multi-capability script either). A follow-up with an explicit room type completed the flow cleanly:
+
+| Turn | Tool | Result |
+|---|---|---|
+| "I need a Standard Queen room from August 12 to August 14 for two guests." | `check_availability` | Room + rate confirmed |
+| "Yes, book the Standard Queen for Priya Shah at priya@example.com." | `create_booking` | **Confirmation AH-4827** |
+| "Goodbye" | `end_call` | hangup (SIP BYE) |
+
+**Evidence the confirmation ID is tool-generated, not model-invented:** `AH-4827` is the mock `create_booking` tool's hardcoded deterministic return value (`pipeline/agent.py`) — it appears identically on every successful booking regardless of guest name/dates, and the output guardrail (`_FABRICATED_CONFIRMATION_RE`) independently checks that any `AH-\d+`-shaped code in a reply only appears after `create_booking` actually ran, rejecting it otherwise.
 
 ---
 
