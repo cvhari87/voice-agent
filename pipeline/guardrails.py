@@ -99,6 +99,32 @@ _ROOM_CAPACITY = {
     "accessible": 2,
 }
 
+
+def _normalize_room_type(value) -> str | None:
+    """Map a model-echoed room-type string to its internal key.
+
+    Mirrors agent.py's own _normalize_room_type (duplicated rather than
+    imported -- agent.py imports GuardrailAgent from this module, so the
+    reverse import would be circular). Needed because a caller is told a
+    display name ("Family Double Queen room available...") and the model
+    naturally echoes that exact string back on create_booking; without
+    normalization, a perfectly valid booking gets rejected as "unknown room
+    type" purely because the model quoted the display name instead of the
+    internal key ("family").
+    """
+    room_type = str(value or "").strip().lower()
+    if not room_type:
+        return None
+    for key in _ROOM_CAPACITY:
+        if key in room_type:
+            return key
+    if "double" in room_type:
+        return "family"
+    if "queen" in room_type:
+        return "standard"
+    return None
+
+
 # Output guardrail: distinctive fragments from the system prompt that should
 # never appear in model output sent to the caller.
 _SYSTEM_PROMPT_FRAGMENTS = (
@@ -331,7 +357,7 @@ class GuardrailAgent:
                     "check_in": str(arguments["check_in"]).strip(),
                     "check_out": str(arguments["check_out"]).strip(),
                     "guests": _guest_count(arguments["guests"]),
-                    "room_type": str(arguments.get("room_type") or "").strip().lower(),
+                    "room_type": _normalize_room_type(arguments.get("room_type")) or "",
                 },
                 "turn_id": turn_id,
                 "booking_fingerprints": set(),
@@ -519,7 +545,7 @@ class GuardrailAgent:
 
         # Room capacity pre-check: if a room type is specified, reject early
         # when guest count exceeds its capacity.
-        room_type = str(args.get("room_type") or "").strip().lower()
+        room_type = _normalize_room_type(args.get("room_type"))
         if room_type and room_type in _ROOM_CAPACITY:
             if guests > _ROOM_CAPACITY[room_type]:
                 return (
@@ -543,7 +569,7 @@ class GuardrailAgent:
         if guests is None or not 1 <= guests <= 5:
             return "booking guest count must be between 1 and 5"
 
-        room_type = str(args["room_type"]).strip().lower()
+        room_type = _normalize_room_type(args["room_type"])
         if room_type not in _ROOM_CAPACITY:
             return "unknown room type"
 
@@ -594,7 +620,7 @@ class GuardrailAgent:
         ):
             return "booking details changed after availability was checked"
         offered_room = offered.get("room_type")
-        if offered_room and str(args["room_type"]).strip().lower() != offered_room:
+        if offered_room and room_type != offered_room:
             return "room type changed after availability was checked"
         if _booking_fingerprint(args) in state["booking_fingerprints"]:
             return "duplicate booking request"

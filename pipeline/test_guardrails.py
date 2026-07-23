@@ -644,6 +644,37 @@ class GuardrailToolTests(unittest.TestCase):
                 )
                 self.assertFalse(decision.allowed, text)
 
+    def test_display_name_room_type_is_normalized_not_rejected(self):
+        """Reproduces a real bug found via a recorded demo: check_availability
+        tells the caller "Family Double Queen room available", and the model
+        naturally echoes that exact display name back on create_booking --
+        which must not be rejected as "unknown room type" just because it
+        isn't the internal key ("family")."""
+        availability = {
+            "check_in": "August 13", "check_out": "August 15",
+            "guests": 5, "room_type": "",
+        }
+        self.guardrail.evaluate_tool_call(
+            "check_availability", availability, "Five guests, August 13th through 15th.", "display-name-room", 1, "availability-turn",
+        )
+        self.guardrail.process_availability_result(
+            "display-name-room",
+            {"result": "Available rooms for August 13 to 15: Family Double Queen at $269/night."},
+        )
+        self.guardrail.evaluate_output(
+            "We have a Family Double Queen room available. Shall I book it?",
+            "display-name-room",
+        )
+        booking = dict(
+            self.booking,
+            check_in="August 13", check_out="August 15",
+            guests=5, room_type="Family Double Queen",
+        )
+        decision = self.guardrail.evaluate_tool_call(
+            "create_booking", booking, "Yes, this is correct.", "display-name-room", 1, "confirm-turn",
+        )
+        self.assertTrue(decision.allowed, decision.reason)
+
     def test_booking_rejects_invalid_fields(self):
         invalid = dict(self.booking, guests=-5, contact="not-contact")
         decision = self.guardrail.evaluate_tool_call(
